@@ -10,7 +10,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from core import AppError, run_pipeline
+from core import AppError, run_live_edit_pipeline, run_pipeline
 from llm_providers import LLMProviderError, available_providers, get_provider
 from secure_storage import (
     SecureStorageError,
@@ -32,8 +32,8 @@ class ShortsApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("900x860")
-        self.minsize(780, 760)
+        self.geometry("940x900")
+        self.minsize(800, 780)
         self.configure(bg="#f4f6fb")
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.last_output: Path | None = None
@@ -67,11 +67,18 @@ class ShortsApp(tk.Tk):
         ttk.Label(root, text="YouTube Shorts 自動メーカー", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             root,
-            text="URLを貼るだけで、字幕取得 → AI選定 → 縦型動画の作成まで自動化します。",
+            text="通常動画のShorts作成と、生配信の不要部分を除く編集をタブで切り替えられます。",
             style="Sub.TLabel",
         ).pack(anchor="w", pady=(3, 18))
 
-        card = ttk.Frame(root, style="Card.TFrame", padding=22)
+        self.mode_notebook = ttk.Notebook(root)
+        self.mode_notebook.pack(fill="x")
+        self.standard_tab = ttk.Frame(self.mode_notebook, style="TFrame")
+        self.live_tab = ttk.Frame(self.mode_notebook, style="TFrame")
+        self.mode_notebook.add(self.standard_tab, text="通常動画・Shorts")
+        self.mode_notebook.add(self.live_tab, text="生配信編集")
+
+        card = ttk.Frame(self.standard_tab, style="Card.TFrame", padding=22)
         card.pack(fill="x")
 
         ttk.Label(card, text="YouTube URL", style="Card.TLabel").grid(row=0, column=0, sticky="w")
@@ -163,12 +170,82 @@ class ShortsApp(tk.Tk):
         for column in range(4):
             card.columnconfigure(column, weight=1)
 
+        live_card = ttk.Frame(self.live_tab, style="Card.TFrame", padding=22)
+        live_card.pack(fill="x")
+        ttk.Label(live_card, text="生配信URL／生配信アーカイブURL", style="Card.TLabel").grid(
+            row=0, column=0, columnspan=4, sticky="w"
+        )
+        self.live_url_var = tk.StringVar()
+        ttk.Entry(live_card, textvariable=self.live_url_var).grid(
+            row=1, column=0, columnspan=4, sticky="ew", pady=(5, 15)
+        )
+        ttk.Label(live_card, text="完成動画の長さ（分）", style="Card.TLabel").grid(
+            row=2, column=0, columnspan=2, sticky="w"
+        )
+        ttk.Label(live_card, text="配信中の取得時間（分）", style="Card.TLabel").grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=(12, 0)
+        )
+        self.live_target_minutes_var = tk.DoubleVar(value=1.0)
+        ttk.Spinbox(
+            live_card,
+            textvariable=self.live_target_minutes_var,
+            from_=0.5,
+            to=30,
+            increment=0.5,
+            width=10,
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(5, 15))
+        self.live_capture_minutes_var = tk.IntVar(value=30)
+        ttk.Spinbox(
+            live_card,
+            textvariable=self.live_capture_minutes_var,
+            from_=1,
+            to=360,
+            width=10,
+        ).grid(row=3, column=2, columnspan=2, sticky="ew", padx=(12, 0), pady=(5, 15))
+        ttk.Label(
+            live_card,
+            text="今回の編集指示（毎回入力・保存しません）",
+            style="Card.TLabel",
+        ).grid(row=4, column=0, columnspan=4, sticky="w")
+        self.live_edit_prompt = tk.Text(
+            live_card,
+            height=5,
+            relief="solid",
+            borderwidth=1,
+            bg="#ffffff",
+            fg="#172033",
+            insertbackground="#172033",
+            font=("Yu Gothic UI", 10),
+            wrap="word",
+        )
+        self.live_edit_prompt.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(5, 4))
+        ttk.Label(
+            live_card,
+            text="例：無言と待ち時間を除く／勝負どころ中心／初心者にも分かる流れにする",
+            style="Card.TLabel",
+            foreground="#667085",
+        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(0, 14))
+        ttk.Label(
+            live_card,
+            text="配信中は現在位置から指定分だけ取得します。終了済み配信はアーカイブ全体を編集します。",
+            style="Card.TLabel",
+        ).grid(row=7, column=0, columnspan=4, sticky="w")
+        ttk.Label(
+            live_card,
+            text="OpenRouter・モデル・Whisper・画質・ログイン設定は「通常動画」タブの設定を使用します。",
+            style="Card.TLabel",
+            foreground="#667085",
+        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        for column in range(4):
+            live_card.columnconfigure(column, weight=1)
+
         action_row = ttk.Frame(root)
         action_row.pack(fill="x", pady=(18, 10))
         self.start_button = ttk.Button(action_row, text="Shortsを作成", style="Accent.TButton", command=self._start)
         self.start_button.pack(side="left")
         self.open_button = ttk.Button(action_row, text="出力フォルダーを開く", command=self._open_output, state="disabled")
         self.open_button.pack(side="left", padx=(10, 0))
+        self.mode_notebook.bind("<<NotebookTabChanged>>", self._on_mode_changed)
 
         self.progress = ttk.Progressbar(root, mode="determinate", maximum=100)
         self.progress.pack(fill="x", pady=(2, 8))
@@ -215,14 +292,30 @@ class ShortsApp(tk.Tk):
             except (TypeError, ValueError):
                 saved_count = 7
             self.clip_count_var.set(min(20, max(1, saved_count)))
+            try:
+                if "live_target_minutes" in data:
+                    target_minutes = float(data["live_target_minutes"])
+                else:
+                    target_minutes = float(data.get("live_target_seconds", 60)) / 60
+                capture_minutes = int(data.get("live_capture_minutes", 30))
+            except (TypeError, ValueError):
+                target_minutes, capture_minutes = 1.0, 30
+            self.live_target_minutes_var.set(min(30, max(0.5, target_minutes)))
+            self.live_capture_minutes_var.set(min(360, max(1, capture_minutes)))
         except SecureStorageError as exc:
             self.after(100, lambda message=str(exc): messagebox.showerror(APP_NAME, message))
 
     def _save_settings(self) -> None:
+        try:
+            live_target_minutes = float(self.live_target_minutes_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            live_target_minutes = 1.0
         data = {
             "whisper": self.whisper_var.get(),
             "resolution": self.resolution_var.get(),
             "clip_count": self.clip_count_var.get(),
+            "live_target_minutes": live_target_minutes,
+            "live_capture_minutes": self.live_capture_minutes_var.get(),
             "llm_provider": self._provider_id(),
             "llm_model": self._selected_model_id(),
         }
@@ -273,7 +366,18 @@ class ShortsApp(tk.Tk):
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def _on_mode_changed(self, _event: object | None = None) -> None:
+        if self.mode_notebook.select() == str(self.live_tab):
+            self.start_button.configure(text="生配信の不要部分を除いて作成")
+            self.status_var.set("生配信URLと完成動画の長さを入力してください。")
+        else:
+            self.start_button.configure(text="Shortsを作成")
+            self.status_var.set("URLとOpenRouter APIキーを入力してください。")
+
     def _start(self) -> None:
+        if self.mode_notebook.select() == str(self.live_tab):
+            self._start_live_edit()
+            return
         url = self.url_var.get().strip()
         key = self.key_var.get().strip()
         provider_id = self._provider_id()
@@ -330,6 +434,71 @@ class ShortsApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _start_live_edit(self) -> None:
+        url = self.live_url_var.get().strip()
+        key = self.key_var.get().strip()
+        provider_id = self._provider_id()
+        model = self._selected_model_id()
+        edit_prompt = self.live_edit_prompt.get("1.0", "end-1c").strip()
+        try:
+            target_minutes = float(self.live_target_minutes_var.get())
+            capture_minutes = int(self.live_capture_minutes_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            messagebox.showwarning(APP_NAME, "完成動画の長さと取得時間を数字で入力してください。")
+            return
+        if not 0.5 <= target_minutes <= 30:
+            messagebox.showwarning(APP_NAME, "完成動画の長さは0.5〜30分で入力してください。")
+            return
+        if not 1 <= capture_minutes <= 360:
+            messagebox.showwarning(APP_NAME, "配信中の取得時間は1〜360分で入力してください。")
+            return
+        if not url or not key or not model:
+            messagebox.showwarning(
+                APP_NAME,
+                "生配信URLを入力し、通常動画タブでOpenRouter APIキーとモデルを設定してください。",
+            )
+            return
+        target_seconds = int(round(target_minutes * 60))
+        try:
+            self._save_settings()
+        except SecureStorageError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self.start_button.configure(state="disabled")
+        self.open_button.configure(state="disabled")
+        self.progress["value"] = 0
+        self._append_log("生配信編集を開始しました。")
+        whisper = {"高速（tiny）": "tiny", "標準（small）": "small", "高精度（medium）": "medium"}[
+            self.whisper_var.get()
+        ]
+        resolution = "1080p" if self.resolution_var.get().startswith("1080") else "720p"
+        browser = {"Edge": "edge", "Chrome": "chrome"}.get(self.browser_var.get())
+
+        def callback(message: str, progress: float | None) -> None:
+            self.events.put(("progress", (message, progress)))
+
+        def worker() -> None:
+            try:
+                result = run_live_edit_pipeline(
+                    url=url,
+                    api_key=key,
+                    output_root=OUTPUT_DIR,
+                    target_seconds=target_seconds,
+                    live_capture_minutes=capture_minutes,
+                    whisper_model=whisper,
+                    llm_provider=provider_id,
+                    llm_model=model,
+                    edit_prompt=edit_prompt,
+                    resolution=resolution,
+                    cookie_browser=browser,
+                    callback=callback,
+                )
+                self.events.put(("done", result))
+            except Exception as exc:
+                self.events.put(("error", exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _poll_events(self) -> None:
         try:
             while True:
@@ -343,12 +512,22 @@ class ShortsApp(tk.Tk):
                 elif event == "done":
                     result = payload  # type: ignore[assignment]
                     self.last_output = Path(result["output_dir"])
-                    clip_count = int(result.get("clip_count", len(result.get("highlights", []))))
                     self.start_button.configure(state="normal")
                     self.open_button.configure(state="normal")
                     self.progress["value"] = 100
-                    self.status_var.set(f"完成しました。{clip_count}本の動画を確認できます。")
-                    messagebox.showinfo(APP_NAME, f"{clip_count}本のShortsを作成しました。\n\n{self.last_output}")
+                    if result.get("mode") == "live_edit":
+                        target_seconds = int(result["target_duration"])
+                        target_minutes = target_seconds / 60
+                        duration_label = f"{target_minutes:g}分"
+                        self.status_var.set(f"完成しました。{duration_label}の動画を確認できます。")
+                        messagebox.showinfo(
+                            APP_NAME,
+                            f"{duration_label}の生配信切り抜き動画を作成しました。\n\n{self.last_output}",
+                        )
+                    else:
+                        clip_count = int(result.get("clip_count", len(result.get("highlights", []))))
+                        self.status_var.set(f"完成しました。{clip_count}本の動画を確認できます。")
+                        messagebox.showinfo(APP_NAME, f"{clip_count}本のShortsを作成しました。\n\n{self.last_output}")
                 elif event == "models":
                     models = payload  # type: ignore[assignment]
                     current_id = self._selected_model_id()

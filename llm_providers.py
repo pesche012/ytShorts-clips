@@ -19,34 +19,38 @@ class LLMModel:
     supports_structured_output: bool = False
 
 
-HIGHLIGHTS_SCHEMA: dict[str, Any] = {
-    "name": "youtube_highlights",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "highlights": {
-                "type": "array",
-                "minItems": 7,
-                "maxItems": 7,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "start": {"type": "number"},
-                        "end": {"type": "number"},
-                        "title": {"type": "string"},
-                        "reason": {"type": "string"},
-                        "score": {"type": "number"},
+def build_highlights_schema(min_items: int = 7, max_items: int = 7) -> dict[str, Any]:
+    return {
+        "name": "youtube_highlights",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "highlights": {
+                    "type": "array",
+                    "minItems": min_items,
+                    "maxItems": max_items,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "start": {"type": "number"},
+                            "end": {"type": "number"},
+                            "title": {"type": "string"},
+                            "reason": {"type": "string"},
+                            "score": {"type": "number"},
+                        },
+                        "required": ["start", "end", "title", "reason", "score"],
+                        "additionalProperties": False,
                     },
-                    "required": ["start", "end", "title", "reason", "score"],
-                    "additionalProperties": False,
-                },
-            }
+                }
+            },
+            "required": ["highlights"],
+            "additionalProperties": False,
         },
-        "required": ["highlights"],
-        "additionalProperties": False,
-    },
-}
+    }
+
+
+HIGHLIGHTS_SCHEMA = build_highlights_schema()
 
 
 class LLMProvider(ABC):
@@ -67,6 +71,7 @@ class LLMProvider(ABC):
         system_prompt: str,
         user_prompt: str,
         timeout: int = 300,
+        json_schema: dict[str, Any] | None = None,
     ) -> str:
         raise NotImplementedError
 
@@ -155,6 +160,7 @@ class OpenRouterProvider(LLMProvider):
         system_prompt: str,
         user_prompt: str,
         timeout: int = 300,
+        json_schema: dict[str, Any] | None = None,
     ) -> str:
         import requests
 
@@ -176,7 +182,7 @@ class OpenRouterProvider(LLMProvider):
             if use_schema:
                 payload["response_format"] = {
                     "type": "json_schema",
-                    "json_schema": HIGHLIGHTS_SCHEMA,
+                    "json_schema": json_schema or HIGHLIGHTS_SCHEMA,
                 }
             try:
                 response = requests.post(

@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from llm_providers import OpenRouterProvider, get_provider
+from llm_providers import OpenRouterProvider, build_highlights_schema, get_provider
 
 
 def fake_response(status_code, payload):
@@ -64,6 +64,22 @@ class OpenRouterProviderTests(unittest.TestCase):
         second_payload = request_post.call_args_list[1].kwargs["json"]
         self.assertIn("response_format", first_payload)
         self.assertNotIn("response_format", second_payload)
+
+    @patch("requests.post")
+    def test_custom_highlight_count_schema(self, request_post):
+        request_post.return_value = fake_response(
+            200,
+            {"choices": [{"message": {"content": '{"highlights": []}'}, "finish_reason": "stop"}]},
+        )
+        OpenRouterProvider().complete_json(
+            "sk-or-test",
+            "example/model",
+            "system",
+            "user",
+            json_schema=build_highlights_schema(3, 3),
+        )
+        schema = request_post.call_args.kwargs["json"]["response_format"]["json_schema"]
+        self.assertEqual(schema["schema"]["properties"]["highlights"]["minItems"], 3)
 
 
 if __name__ == "__main__":

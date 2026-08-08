@@ -56,6 +56,10 @@ def seconds_to_timestamp(value: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
 
 
+def format_duration_label(seconds: int) -> str:
+    return f"{seconds / 60:g}分"
+
+
 def parse_timestamp(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
@@ -237,6 +241,7 @@ def download_video(
     ffmpeg_path: str,
     cookie_browser: str | None,
     callback: ProgressCallback | None,
+    max_duration_seconds: float | None = None,
 ) -> Path:
     import yt_dlp
 
@@ -258,6 +263,17 @@ def download_video(
             "progress_hooks": [hook],
         }
     )
+    if max_duration_seconds is not None:
+        try:
+            from yt_dlp.utils import download_range_func
+
+            options["download_ranges"] = download_range_func(
+                None, [(0, float(max_duration_seconds))]
+            )
+            options["force_keyframes_at_cuts"] = True
+            options["live_from_start"] = False
+        except ImportError as exc:
+            raise AppError("生配信の時間指定に対応したyt-dlpが必要です。setup.batを実行してください。") from exc
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.extract_info(url, download=True)
@@ -418,7 +434,7 @@ def find_highlights_with_llm(
     callback: ProgressCallback | None = None,
 ) -> list[Highlight]:
     try:
-        from llm_providers import LLMProviderError, get_provider
+        from llm_providers import LLMProviderError, build_highlights_schema, get_provider
     except ImportError as exc:
         raise AppError("LLM接続モジュールが見つかりません。アプリを再インストールしてください。") from exc
 
@@ -441,6 +457,7 @@ def find_highlights_with_llm(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 timeout=300,
+                json_schema=build_highlights_schema(clip_count, clip_count),
             )
             return normalize_highlights(_extract_json(content), duration, clip_count)
         except LLMProviderError as exc:
@@ -453,6 +470,137 @@ def find_highlights_with_llm(
         if attempt < 3:
             time.sleep(1.5 * attempt)
     raise AppError(f"LLMから見どころを取得できませんでした。\n{last_error}")
+
+
+def build_live_edit_prompts(
+    transcript: list[TranscriptSegment],
+    duration: float,
+    target_seconds: int,
+    custom_instructions: str = "",
+) -> tuple[str, str]:
+    transcript_text = transcript_as_text(transcript)
+    instructions = custom_instructions.strip() or "指定なし。盛り上がりと分かりやすさを優先する"
+    system_prompt = (
+        "あなたは生配信の切り抜きを作る熟練動画編集者です。"
+        "退屈な間、無言、重複、脱線を除き、見どころだけで自然につながる1本を設計します。"
+        "有効なタイムスタンプとJSON形式を必ず守ってください。"
+    )
+    user_prompt = f"""
+元動画は {duration:.1f} 秒です。完成動画を {target_seconds} 秒にするため、採用する区間を時系列順に選んでください。
+
+今回の編集方針（ユーザー指定）:
+{instructions}
+
+条件:
+- highlightsの合計時間は {target_seconds} 秒以上、{target_seconds + 30} 秒以内にする
+- 各区間は原則8〜90秒で、話の途中から始めず結論の直後で終える
+- 無言、待ち時間、同じ話、内輪だけのやり取り、不要な脱線を除く
+- 1本の動画として導入・展開・結論が自然につながるようにする
+- 区間を重複させず、元動画での時系列順に並べる
+- startとendは元動画先頭からの秒数（数値）
+- titleとreasonは日本語、scoreは重要度を0〜100で評価
+- 結果は次のjson形式のみ:
+{{"highlights":[{{"start":12.3,"end":48.0,"title":"採用場面","reason":"採用理由","score":92}}]}}
+
+文字起こし:
+{transcript_text}
+""".strip()
+    return system_prompt, user_prompt
+
+
+def normalize_live_edit_segments(
+    data: Any,
+    duration: float,
+    target_seconds: int,
+) -> list[Highlight]:
+    items = data.get("highlights") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise ValueError("highlights配列がありません")
+    candidates: list[Highlight] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = max(0.0, parse_timestamp(item.get("start", 0)))
+            end = min(duration, parse_timestamp(item.get("end", start)))
+        except (TypeError, ValueError):
+            continue
+        if end - start < 3:
+            continue
+        try:
+            score = float(item.get("score", 0))
+        except (TypeError, ValueError):
+            score = 0.0
+        candidates.append(
+            Highlight(
+                start=start,
+                end=end,
+                title=str(item.get("title") or f"採用場面 {index + 1}")[:60],
+                reason=str(item.get("reason") or "見どころ")[:200],
+                score=score,
+            )
+        )
+    result: list[Highlight] = []
+    total = 0.0
+    for item in sorted(candidates, key=lambda value: value.start):
+        if result and item.start < result[-1].end:
+            item.start = result[-1].end
+        if item.end - item.start < 3:
+            continue
+        result.append(item)
+        total += item.end - item.start
+        if total >= target_seconds:
+            break
+    if total < target_seconds:
+        raise ValueError(
+            f"採用区間が{total:.0f}秒しかなく、指定された{target_seconds}秒に足りません"
+        )
+    return result
+
+
+def find_live_edit_segments_with_llm(
+    transcript: list[TranscriptSegment],
+    duration: float,
+    target_seconds: int,
+    api_key: str,
+    provider_id: str,
+    model: str,
+    custom_instructions: str = "",
+    callback: ProgressCallback | None = None,
+) -> list[Highlight]:
+    try:
+        from llm_providers import LLMProviderError, build_highlights_schema, get_provider
+    except ImportError as exc:
+        raise AppError("LLM接続モジュールが見つかりません。アプリを再インストールしてください。") from exc
+    provider = get_provider(provider_id)
+    system_prompt, user_prompt = build_live_edit_prompts(
+        transcript, duration, target_seconds, custom_instructions
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        _notify(callback, f"{provider.display_name} / {model} が不要部分を除いています…（{attempt}/3）", 0.48)
+        try:
+            content = provider.complete_json(
+                api_key=api_key,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                timeout=300,
+                json_schema=build_highlights_schema(1, 30),
+            )
+            return normalize_live_edit_segments(
+                _extract_json(content), duration, target_seconds
+            )
+        except LLMProviderError as exc:
+            last_error = exc
+            message = str(exc)
+            if any(word in message for word in ("APIキー", "残高", "利用上限", "未対応")):
+                raise AppError(message) from exc
+        except Exception as exc:
+            last_error = exc
+        if attempt < 3:
+            time.sleep(1.5 * attempt)
+    raise AppError(f"LLMから生配信の編集区間を取得できませんでした。\n{last_error}")
 
 
 def cut_vertical_clip(
@@ -509,6 +657,55 @@ def cut_vertical_clip(
     if completed.returncode != 0:
         message = (completed.stderr or "FFmpegの処理に失敗しました").strip()
         raise AppError(f"動画の切り抜きに失敗しました。\n{message[-800:]}")
+
+
+def cut_standard_clip(
+    ffmpeg_path: str,
+    video_path: Path,
+    output_path: Path,
+    start: float,
+    end: float,
+    resolution: str,
+) -> None:
+    max_height = 1080 if resolution == "1080p" else 720
+    duration = max(0.1, end - start)
+    command = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{start:.3f}",
+        "-i",
+        str(video_path),
+        "-t",
+        f"{duration:.3f}",
+        "-vf",
+        f"scale=-2:min(ih\\,{max_height}),format=yuv420p",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    completed = subprocess.run(command, capture_output=True, text=True, creationflags=creationflags)
+    if completed.returncode != 0:
+        message = (completed.stderr or "FFmpegの処理に失敗しました").strip()
+        raise AppError(f"通常動画の切り抜きに失敗しました。\n{message[-800:]}")
 
 
 def run_pipeline(
@@ -603,3 +800,226 @@ def run_pipeline(
         (final_dir / "文字起こし.txt").write_text(transcript_as_text(transcript), encoding="utf-8")
         _notify(callback, "完了しました。", 1.0)
         return {"output_dir": str(final_dir), **report}
+
+
+def probe_video_duration(ffmpeg_path: str, video_path: Path) -> float:
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    completed = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-i", str(video_path)],
+        capture_output=True,
+        text=True,
+        creationflags=creationflags,
+    )
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", completed.stderr or "")
+    if not match:
+        return 0.0
+    return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+
+def create_live_montage(
+    ffmpeg_path: str,
+    video_path: Path,
+    output_path: Path,
+    segments: list[Highlight],
+    target_seconds: int,
+    resolution: str,
+    work_dir: Path,
+    callback: ProgressCallback | None = None,
+) -> None:
+    parts_dir = work_dir / "live_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    part_paths: list[Path] = []
+    for index, item in enumerate(segments, start=1):
+        part_path = parts_dir / f"part_{index:03d}.mp4"
+        _notify(
+            callback,
+            f"採用場面 {index}/{len(segments)} を切り出しています…",
+            0.56 + (index / len(segments)) * 0.28,
+        )
+        cut_standard_clip(
+            ffmpeg_path,
+            video_path,
+            part_path,
+            item.start,
+            item.end,
+            resolution,
+        )
+        part_paths.append(part_path)
+
+    concat_path = parts_dir / "concat.txt"
+    concat_path.write_text(
+        "\n".join(f"file '{path.as_posix()}'" for path in part_paths) + "\n",
+        encoding="utf-8",
+    )
+    _notify(
+        callback,
+        f"不要部分を除き、{format_duration_label(target_seconds)}の動画へまとめています…",
+        0.88,
+    )
+    command = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat_path),
+        "-t",
+        str(target_seconds),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    completed = subprocess.run(command, capture_output=True, text=True, creationflags=creationflags)
+    if completed.returncode != 0:
+        message = (completed.stderr or "FFmpegの結合処理に失敗しました").strip()
+        raise AppError(f"生配信の切り抜き動画を結合できませんでした。\n{message[-800:]}")
+
+
+def run_live_edit_pipeline(
+    url: str,
+    api_key: str,
+    output_root: Path,
+    target_seconds: int,
+    live_capture_minutes: int = 30,
+    whisper_model: str = "small",
+    llm_provider: str = "openrouter",
+    llm_model: str = "openrouter/auto",
+    edit_prompt: str = "",
+    resolution: str = "720p",
+    cookie_browser: str | None = None,
+    callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    if not re.match(r"^https?://", url.strip(), flags=re.IGNORECASE):
+        raise AppError("YouTubeの生配信URLを正しく入力してください。")
+    if not 30 <= target_seconds <= 1800:
+        raise AppError("完成動画の長さは0.5〜30分で指定してください。")
+    if not 1 <= live_capture_minutes <= 360:
+        raise AppError("生配信の取得時間は1〜360分で指定してください。")
+    output_root.mkdir(parents=True, exist_ok=True)
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        raise AppError("動画処理エンジンを準備できません。setup.batをもう一度実行してください。") from exc
+
+    with tempfile.TemporaryDirectory(prefix=".youtube-live-edit-", dir=output_root) as temp_name:
+        work_dir = Path(temp_name)
+        _notify(callback, "生配信の情報を確認しています…", 0.02)
+        info = fetch_metadata(url.strip(), ffmpeg_path, cookie_browser)
+        title = str(info.get("title") or info.get("id") or "youtube_live")
+        live_status = str(info.get("live_status") or "")
+        is_live = bool(info.get("is_live")) or live_status == "is_live"
+
+        if is_live:
+            capture_seconds = live_capture_minutes * 60
+            if target_seconds > capture_seconds:
+                raise AppError("完成動画の長さは、生配信の取得時間より短くしてください。")
+            _notify(
+                callback,
+                f"配信中の映像を現在位置から{live_capture_minutes}分取得します…",
+                0.05,
+            )
+            video_path = download_video(
+                url.strip(),
+                work_dir,
+                ffmpeg_path,
+                cookie_browser,
+                callback,
+                max_duration_seconds=capture_seconds,
+            )
+            transcript_source = "Whisper（配信中の取得映像）"
+            transcript = transcribe_with_whisper(video_path, whisper_model, callback)
+            duration = probe_video_duration(ffmpeg_path, video_path)
+            if duration <= 0:
+                duration = max(item.end for item in transcript)
+            source_status = "live"
+        else:
+            duration = float(info.get("duration") or 0)
+            if duration <= 0:
+                raise AppError("生配信アーカイブの長さを取得できませんでした。")
+            _notify(callback, "生配信アーカイブの字幕を確認しています…", 0.05)
+            caption = download_caption(url.strip(), info, work_dir, ffmpeg_path, cookie_browser)
+            if caption:
+                transcript, transcript_source = caption
+                _notify(callback, f"{transcript_source}を取得しました。", 0.24)
+            else:
+                transcript = []
+                transcript_source = "Whisper"
+                _notify(callback, "字幕がないためWhisperを使用します。", 0.24)
+            video_path = download_video(
+                url.strip(), work_dir, ffmpeg_path, cookie_browser, callback
+            )
+            if not transcript:
+                transcript = transcribe_with_whisper(video_path, whisper_model, callback)
+            source_status = "archive"
+
+        if target_seconds > duration:
+            raise AppError(
+                f"完成動画の長さ（{format_duration_label(target_seconds)}）は、"
+                f"取得した映像（{format_duration_label(int(duration))}）より短くしてください。"
+            )
+        segments = find_live_edit_segments_with_llm(
+            transcript=transcript,
+            duration=duration,
+            target_seconds=target_seconds,
+            api_key=api_key,
+            provider_id=llm_provider,
+            model=llm_model,
+            custom_instructions=edit_prompt,
+            callback=callback,
+        )
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        final_dir = output_root / f"{safe_filename(title)}_生配信編集_{stamp}"
+        final_dir.mkdir(parents=True, exist_ok=False)
+        duration_label = format_duration_label(target_seconds)
+        output_path = final_dir / f"生配信切り抜き_{duration_label}.mp4"
+        create_live_montage(
+            ffmpeg_path=ffmpeg_path,
+            video_path=video_path,
+            output_path=output_path,
+            segments=segments,
+            target_seconds=target_seconds,
+            resolution=resolution,
+            work_dir=work_dir,
+            callback=callback,
+        )
+        report = {
+            "mode": "live_edit",
+            "source_url": url.strip(),
+            "video_title": title,
+            "source_status": source_status,
+            "source_duration": duration,
+            "target_duration": target_seconds,
+            "target_duration_minutes": target_seconds / 60,
+            "transcript_source": transcript_source,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "segments": [asdict(item) for item in segments],
+        }
+        (final_dir / "編集内容.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        (final_dir / "文字起こし.txt").write_text(
+            transcript_as_text(transcript), encoding="utf-8"
+        )
+        _notify(callback, "生配信の切り抜き動画が完成しました。", 1.0)
+        return {"output_dir": str(final_dir), "output_file": str(output_path), **report}

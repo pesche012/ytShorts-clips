@@ -10,7 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core import (
     TranscriptSegment,
     build_highlight_prompts,
+    build_live_edit_prompts,
+    format_duration_label,
     normalize_highlights,
+    normalize_live_edit_segments,
     parse_json3,
     parse_timestamp,
     parse_vtt,
@@ -76,6 +79,31 @@ class CoreTests(unittest.TestCase):
         _, user_prompt = build_highlight_prompts([], 120, "  ")
         self.assertIn("指定なし。標準方針で選定する", user_prompt)
         self.assertIn("必ず7個", user_prompt)
+
+    def test_live_edit_prompt_includes_target_duration(self):
+        _, user_prompt = build_live_edit_prompts(
+            [TranscriptSegment(0, 10, "生配信の内容")],
+            duration=600,
+            target_seconds=90,
+            custom_instructions="ゲームの勝負どころを優先",
+        )
+        self.assertIn("90 秒", user_prompt)
+        self.assertIn("ゲームの勝負どころを優先", user_prompt)
+
+    def test_live_edit_segments_cover_target_duration(self):
+        data = {
+            "highlights": [
+                {"start": 0, "end": 30, "title": "1", "reason": "理由", "score": 90},
+                {"start": 40, "end": 80, "title": "2", "reason": "理由", "score": 80},
+            ]
+        }
+        result = normalize_live_edit_segments(data, duration=120, target_seconds=60)
+        self.assertEqual(len(result), 2)
+        self.assertGreaterEqual(sum(item.end - item.start for item in result), 60)
+
+    def test_duration_label_uses_minutes(self):
+        self.assertEqual(format_duration_label(60), "1分")
+        self.assertEqual(format_duration_label(90), "1.5分")
 
 
 if __name__ == "__main__":
