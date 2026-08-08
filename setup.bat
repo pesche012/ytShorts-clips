@@ -53,8 +53,11 @@ if not defined DENO_EXE goto :deno_missing
 "%DENO_EXE%" --version >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto :error
 
-".venv\Scripts\python.exe" -c "import imageio_ffmpeg, yt_dlp, requests, faster_whisper; print(imageio_ffmpeg.get_ffmpeg_exe())" >>"%LOG_FILE%" 2>&1
+".venv\Scripts\python.exe" -c "import imageio_ffmpeg, yt_dlp, requests, faster_whisper, keyring; print(imageio_ffmpeg.get_ffmpeg_exe())" >>"%LOG_FILE%" 2>&1
 if errorlevel 1 goto :error
+
+where git >nul 2>nul
+if not errorlevel 1 if exist ".git" git config core.hooksPath .githooks >>"%LOG_FILE%" 2>&1
 
 echo.
 echo Setup completed successfully. Starting the app...

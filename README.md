@@ -49,7 +49,15 @@ OpenRouter APIキーは [OpenRouter Keys](https://openrouter.ai/settings/keys) �
 
 - 自分が権利を持つ動画、またはダウンロード・編集・再投稿の許可を得た動画だけを使用してください。
 - YouTubeやOpenRouter側の仕様変更により、依存機能の更新が必要になる場合があります。その場合は `setup.bat` をもう一度実行してください。
-- OpenRouter APIキーを保存する場合、Windowsの `%APPDATA%\YouTubeShortMaker\settings.json` に保存されます。共有PCでは保存しないでください。
+- OpenRouter APIキーを保存する場合は、平文ファイルではなくWindows資格情報マネージャーへ保存されます。
+- `%APPDATA%\YouTubeShortMaker\settings.json` にはモデル名など秘密ではない設定だけが保存されます。
+- 旧バージョンで平文保存されていたAPIキーは、初回起動時にWindows資格情報マネージャーへ自動移行され、設定ファイルから削除されます。
+
+## APIキーの流出防止
+
+- `.env`、設定ファイル、ログ、仮想環境、生成動画は `.gitignore` でGitHub対象外です。
+- コミット前フックとGitHub Actionsで、OpenRouter・GitHubなどのキー形式や秘密鍵を検査します。
+- APIキーをログへ出力する処理はありません。
 
 ## 将来のLLM拡張
 

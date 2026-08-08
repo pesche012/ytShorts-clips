@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import queue
 import subprocess
@@ -13,6 +12,13 @@ from tkinter import messagebox, ttk
 
 from core import AppError, run_pipeline
 from llm_providers import LLMProviderError, available_providers, get_provider
+from secure_storage import (
+    SecureStorageError,
+    delete_api_key,
+    load_settings_and_migrate,
+    set_api_key,
+    write_public_settings,
+)
 
 
 APP_NAME = "YouTube Shorts 自動メーカー"
@@ -160,31 +166,31 @@ class ShortsApp(tk.Tk):
 
     def _load_settings(self) -> None:
         try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            data, saved_key = load_settings_and_migrate(CONFIG_PATH)
             provider_id = data.get("llm_provider", "openrouter")
             provider = next((item for item in self.providers if item.provider_id == provider_id), self.providers[0])
             self.provider_var.set(provider.display_name)
-            saved_key = data.get("api_key", "")
-            # Do not mistake a key saved by the old DeepSeek-only version for an OpenRouter key.
-            if saved_key and (data.get("llm_provider") or saved_key.startswith("sk-or-")):
-                self.key_var.set(data["api_key"])
+            if saved_key:
+                self.key_var.set(saved_key)
                 self.save_key_var.set(True)
             self.model_var.set(data.get("llm_model", provider.default_model))
             self.whisper_var.set(data.get("whisper", self.whisper_var.get()))
             self.resolution_var.set(data.get("resolution", self.resolution_var.get()))
-        except (OSError, ValueError):
-            pass
+        except SecureStorageError as exc:
+            self.after(100, lambda message=str(exc): messagebox.showerror(APP_NAME, message))
 
     def _save_settings(self) -> None:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         data = {
             "whisper": self.whisper_var.get(),
             "resolution": self.resolution_var.get(),
             "llm_provider": self._provider_id(),
             "llm_model": self._selected_model_id(),
-            "api_key": self.key_var.get().strip() if self.save_key_var.get() else "",
         }
-        CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        if self.save_key_var.get():
+            set_api_key(self.key_var.get().strip())
+        else:
+            delete_api_key()
+        write_public_settings(CONFIG_PATH, data)
 
     def _provider_id(self) -> str:
         return self.provider_name_to_id.get(self.provider_var.get(), "openrouter")
@@ -235,7 +241,11 @@ class ShortsApp(tk.Tk):
         if not url or not key or not model:
             messagebox.showwarning(APP_NAME, "YouTube URL、OpenRouter APIキー、モデルを入力してください。")
             return
-        self._save_settings()
+        try:
+            self._save_settings()
+        except SecureStorageError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
         self.start_button.configure(state="disabled")
         self.open_button.configure(state="disabled")
         self.progress["value"] = 0
