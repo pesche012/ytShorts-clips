@@ -32,8 +32,8 @@ class ShortsApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("860x760")
-        self.minsize(760, 680)
+        self.geometry("900x860")
+        self.minsize(780, 760)
         self.configure(bg="#f4f6fb")
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.last_output: Path | None = None
@@ -109,23 +109,47 @@ class ShortsApp(tk.Tk):
         self.models_button = ttk.Button(card, text="モデル一覧を更新", command=self._refresh_models)
         self.models_button.grid(row=6, column=3, padx=(8, 0), pady=(5, 14), sticky="ew")
 
-        ttk.Label(card, text="Whisper精度", style="Card.TLabel").grid(row=7, column=0, sticky="w")
-        ttk.Label(card, text="動画サイズ", style="Card.TLabel").grid(row=7, column=1, sticky="w", padx=(12, 0))
-        ttk.Label(card, text="ログイン動画", style="Card.TLabel").grid(row=7, column=2, sticky="w", padx=(12, 0))
+        ttk.Label(
+            card,
+            text="今回の切り抜き指示（毎回入力・保存しません）",
+            style="Card.TLabel",
+        ).grid(row=7, column=0, columnspan=4, sticky="w")
+        self.highlight_prompt = tk.Text(
+            card,
+            height=4,
+            relief="solid",
+            borderwidth=1,
+            bg="#ffffff",
+            fg="#172033",
+            insertbackground="#172033",
+            font=("Yu Gothic UI", 10),
+            wrap="word",
+        )
+        self.highlight_prompt.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(5, 4))
+        ttk.Label(
+            card,
+            text="例：テンポ重視／驚きの発言を優先／30秒前後／初心者向けの場面",
+            style="Card.TLabel",
+            foreground="#667085",
+        ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(0, 14))
+
+        ttk.Label(card, text="Whisper精度", style="Card.TLabel").grid(row=10, column=0, sticky="w")
+        ttk.Label(card, text="動画サイズ", style="Card.TLabel").grid(row=10, column=1, sticky="w", padx=(12, 0))
+        ttk.Label(card, text="ログイン動画", style="Card.TLabel").grid(row=10, column=2, sticky="w", padx=(12, 0))
 
         self.whisper_var = tk.StringVar(value="標準（small）")
         self.whisper_combo = ttk.Combobox(
             card, textvariable=self.whisper_var, state="readonly", values=("高速（tiny）", "標準（small）", "高精度（medium）")
         )
-        self.whisper_combo.grid(row=8, column=0, sticky="ew", pady=(5, 0))
+        self.whisper_combo.grid(row=11, column=0, sticky="ew", pady=(5, 0))
         self.resolution_var = tk.StringVar(value="720p（高速）")
         ttk.Combobox(
             card, textvariable=self.resolution_var, state="readonly", values=("720p（高速）", "1080p（高画質）")
-        ).grid(row=8, column=1, sticky="ew", padx=(12, 0), pady=(5, 0))
+        ).grid(row=11, column=1, sticky="ew", padx=(12, 0), pady=(5, 0))
         self.browser_var = tk.StringVar(value="使用しない")
         ttk.Combobox(
             card, textvariable=self.browser_var, state="readonly", values=("使用しない", "Edge", "Chrome")
-        ).grid(row=8, column=2, columnspan=2, sticky="ew", padx=(12, 0), pady=(5, 0))
+        ).grid(row=11, column=2, columnspan=2, sticky="ew", padx=(12, 0), pady=(5, 0))
         for column in range(4):
             card.columnconfigure(column, weight=1)
 
@@ -238,6 +262,7 @@ class ShortsApp(tk.Tk):
         key = self.key_var.get().strip()
         provider_id = self._provider_id()
         model = self._selected_model_id()
+        highlight_prompt = self.highlight_prompt.get("1.0", "end-1c").strip()
         if not url or not key or not model:
             messagebox.showwarning(APP_NAME, "YouTube URL、OpenRouter APIキー、モデルを入力してください。")
             return
@@ -269,6 +294,7 @@ class ShortsApp(tk.Tk):
                     whisper_model=whisper,
                     llm_provider=provider_id,
                     llm_model=model,
+                    highlight_prompt=highlight_prompt,
                     resolution=resolution,
                     cookie_browser=browser,
                     callback=callback,

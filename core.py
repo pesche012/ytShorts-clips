@@ -365,31 +365,24 @@ def normalize_highlights(data: Any, duration: float) -> list[Highlight]:
     return result
 
 
-def find_highlights_with_llm(
+def build_highlight_prompts(
     transcript: list[TranscriptSegment],
     duration: float,
-    api_key: str,
-    provider_id: str = "openrouter",
-    model: str = "openrouter/auto",
-    callback: ProgressCallback | None = None,
-) -> list[Highlight]:
-    try:
-        from llm_providers import LLMProviderError, get_provider
-    except ImportError as exc:
-        raise AppError("LLM接続モジュールが見つかりません。アプリを再インストールしてください。") from exc
-
-    try:
-        provider = get_provider(provider_id)
-    except LLMProviderError as exc:
-        raise AppError(str(exc)) from exc
-
+    custom_instructions: str = "",
+) -> tuple[str, str]:
     transcript_text = transcript_as_text(transcript)
+    instructions = custom_instructions.strip() or "指定なし。標準方針で選定する"
     system_prompt = (
         "あなたはYouTube Shortsの熟練編集者です。文字起こしから視聴維持率が高くなる場面を選びます。"
+        "ユーザー指定は内容・雰囲気・長さの希望として優先しますが、"
+        "7件・有効なタイムスタンプ・JSON形式の条件は必ず守ってください。"
         "必ず有効なjsonだけを返してください。"
     )
     user_prompt = f"""
 動画の長さは {duration:.1f} 秒です。以下のタイムスタンプ付き文字起こしから、最も魅力的な見どころを必ず7個選んでください。
+
+今回の編集方針（ユーザー指定）:
+{instructions}
 
 条件:
 - 各クリップは原則15〜60秒。話の途中から始めず、オチや結論の直後で終える
@@ -404,6 +397,31 @@ def find_highlights_with_llm(
 文字起こし:
 {transcript_text}
 """.strip()
+    return system_prompt, user_prompt
+
+
+def find_highlights_with_llm(
+    transcript: list[TranscriptSegment],
+    duration: float,
+    api_key: str,
+    provider_id: str = "openrouter",
+    model: str = "openrouter/auto",
+    custom_instructions: str = "",
+    callback: ProgressCallback | None = None,
+) -> list[Highlight]:
+    try:
+        from llm_providers import LLMProviderError, get_provider
+    except ImportError as exc:
+        raise AppError("LLM接続モジュールが見つかりません。アプリを再インストールしてください。") from exc
+
+    try:
+        provider = get_provider(provider_id)
+    except LLMProviderError as exc:
+        raise AppError(str(exc)) from exc
+
+    system_prompt, user_prompt = build_highlight_prompts(
+        transcript, duration, custom_instructions
+    )
 
     last_error: Exception | None = None
     for attempt in range(1, 4):
@@ -492,6 +510,7 @@ def run_pipeline(
     whisper_model: str = "small",
     llm_provider: str = "openrouter",
     llm_model: str = "openrouter/auto",
+    highlight_prompt: str = "",
     resolution: str = "720p",
     cookie_browser: str | None = None,
     callback: ProgressCallback | None = None,
@@ -530,7 +549,13 @@ def run_pipeline(
             transcript = transcribe_with_whisper(video_path, whisper_model, callback)
 
         highlights = find_highlights_with_llm(
-            transcript, duration, api_key, llm_provider, llm_model, callback
+            transcript=transcript,
+            duration=duration,
+            api_key=api_key,
+            provider_id=llm_provider,
+            model=llm_model,
+            custom_instructions=highlight_prompt,
+            callback=callback,
         )
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

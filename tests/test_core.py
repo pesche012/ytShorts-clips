@@ -7,7 +7,15 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import normalize_highlights, parse_json3, parse_timestamp, parse_vtt, safe_filename
+from core import (
+    TranscriptSegment,
+    build_highlight_prompts,
+    normalize_highlights,
+    parse_json3,
+    parse_timestamp,
+    parse_vtt,
+    safe_filename,
+)
 
 
 class CoreTests(unittest.TestCase):
@@ -52,6 +60,20 @@ class CoreTests(unittest.TestCase):
         result = normalize_highlights(items, 300)
         self.assertEqual(len(result), 7)
         self.assertEqual(result[-1].title, "場面7")
+
+    def test_custom_highlight_prompt_is_included(self):
+        custom_prompt = "テンポ重視で、30秒前後の場面を選ぶ"
+        _, user_prompt = build_highlight_prompts(
+            [TranscriptSegment(0, 2, "テスト文字起こし")],
+            120,
+            custom_prompt,
+        )
+        self.assertIn(custom_prompt, user_prompt)
+        self.assertIn("必ず7個", user_prompt)
+
+    def test_blank_highlight_prompt_uses_standard_policy(self):
+        _, user_prompt = build_highlight_prompts([], 120, "  ")
+        self.assertIn("指定なし。標準方針で選定する", user_prompt)
 
 
 if __name__ == "__main__":
