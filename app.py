@@ -67,7 +67,7 @@ class ShortsApp(tk.Tk):
         ttk.Label(root, text="YouTube Shorts 自動メーカー", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             root,
-            text="URLを貼るだけで、字幕取得 → AI選定 → 縦型動画7本の作成まで自動化します。",
+            text="URLを貼るだけで、字幕取得 → AI選定 → 縦型動画の作成まで自動化します。",
             style="Sub.TLabel",
         ).pack(anchor="w", pady=(3, 18))
 
@@ -136,6 +136,7 @@ class ShortsApp(tk.Tk):
         ttk.Label(card, text="Whisper精度", style="Card.TLabel").grid(row=10, column=0, sticky="w")
         ttk.Label(card, text="動画サイズ", style="Card.TLabel").grid(row=10, column=1, sticky="w", padx=(12, 0))
         ttk.Label(card, text="ログイン動画", style="Card.TLabel").grid(row=10, column=2, sticky="w", padx=(12, 0))
+        ttk.Label(card, text="作成本数", style="Card.TLabel").grid(row=10, column=3, sticky="w", padx=(12, 0))
 
         self.whisper_var = tk.StringVar(value="標準（small）")
         self.whisper_combo = ttk.Combobox(
@@ -149,13 +150,22 @@ class ShortsApp(tk.Tk):
         self.browser_var = tk.StringVar(value="使用しない")
         ttk.Combobox(
             card, textvariable=self.browser_var, state="readonly", values=("使用しない", "Edge", "Chrome")
-        ).grid(row=11, column=2, columnspan=2, sticky="ew", padx=(12, 0), pady=(5, 0))
+        ).grid(row=11, column=2, sticky="ew", padx=(12, 0), pady=(5, 0))
+        self.clip_count_var = tk.IntVar(value=7)
+        ttk.Spinbox(
+            card,
+            textvariable=self.clip_count_var,
+            from_=1,
+            to=20,
+            state="readonly",
+            width=7,
+        ).grid(row=11, column=3, sticky="ew", padx=(12, 0), pady=(5, 0))
         for column in range(4):
             card.columnconfigure(column, weight=1)
 
         action_row = ttk.Frame(root)
         action_row.pack(fill="x", pady=(18, 10))
-        self.start_button = ttk.Button(action_row, text="7本のShortsを作成", style="Accent.TButton", command=self._start)
+        self.start_button = ttk.Button(action_row, text="Shortsを作成", style="Accent.TButton", command=self._start)
         self.start_button.pack(side="left")
         self.open_button = ttk.Button(action_row, text="出力フォルダーを開く", command=self._open_output, state="disabled")
         self.open_button.pack(side="left", padx=(10, 0))
@@ -200,6 +210,11 @@ class ShortsApp(tk.Tk):
             self.model_var.set(data.get("llm_model", provider.default_model))
             self.whisper_var.set(data.get("whisper", self.whisper_var.get()))
             self.resolution_var.set(data.get("resolution", self.resolution_var.get()))
+            try:
+                saved_count = int(data.get("clip_count", 7))
+            except (TypeError, ValueError):
+                saved_count = 7
+            self.clip_count_var.set(min(20, max(1, saved_count)))
         except SecureStorageError as exc:
             self.after(100, lambda message=str(exc): messagebox.showerror(APP_NAME, message))
 
@@ -207,6 +222,7 @@ class ShortsApp(tk.Tk):
         data = {
             "whisper": self.whisper_var.get(),
             "resolution": self.resolution_var.get(),
+            "clip_count": self.clip_count_var.get(),
             "llm_provider": self._provider_id(),
             "llm_model": self._selected_model_id(),
         }
@@ -263,6 +279,14 @@ class ShortsApp(tk.Tk):
         provider_id = self._provider_id()
         model = self._selected_model_id()
         highlight_prompt = self.highlight_prompt.get("1.0", "end-1c").strip()
+        try:
+            clip_count = int(self.clip_count_var.get())
+        except (tk.TclError, TypeError, ValueError):
+            messagebox.showwarning(APP_NAME, "作成本数は1〜20本で選んでください。")
+            return
+        if not 1 <= clip_count <= 20:
+            messagebox.showwarning(APP_NAME, "作成本数は1〜20本で選んでください。")
+            return
         if not url or not key or not model:
             messagebox.showwarning(APP_NAME, "YouTube URL、OpenRouter APIキー、モデルを入力してください。")
             return
@@ -295,6 +319,7 @@ class ShortsApp(tk.Tk):
                     llm_provider=provider_id,
                     llm_model=model,
                     highlight_prompt=highlight_prompt,
+                    clip_count=clip_count,
                     resolution=resolution,
                     cookie_browser=browser,
                     callback=callback,
@@ -318,11 +343,12 @@ class ShortsApp(tk.Tk):
                 elif event == "done":
                     result = payload  # type: ignore[assignment]
                     self.last_output = Path(result["output_dir"])
+                    clip_count = int(result.get("clip_count", len(result.get("highlights", []))))
                     self.start_button.configure(state="normal")
                     self.open_button.configure(state="normal")
                     self.progress["value"] = 100
-                    self.status_var.set("完成しました。7本の動画を確認できます。")
-                    messagebox.showinfo(APP_NAME, f"7本のShortsを作成しました。\n\n{self.last_output}")
+                    self.status_var.set(f"完成しました。{clip_count}本の動画を確認できます。")
+                    messagebox.showinfo(APP_NAME, f"{clip_count}本のShortsを作成しました。\n\n{self.last_output}")
                 elif event == "models":
                     models = payload  # type: ignore[assignment]
                     current_id = self._selected_model_id()

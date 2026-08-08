@@ -329,7 +329,9 @@ def _extract_json(text: str) -> Any:
         raise
 
 
-def normalize_highlights(data: Any, duration: float) -> list[Highlight]:
+def normalize_highlights(data: Any, duration: float, clip_count: int = 7) -> list[Highlight]:
+    if not 1 <= clip_count <= 20:
+        raise ValueError("作成本数は1〜20本で指定してください")
     items = data.get("highlights") if isinstance(data, dict) else data
     if not isinstance(items, list):
         raise ValueError("highlights配列がありません")
@@ -358,10 +360,12 @@ def normalize_highlights(data: Any, duration: float) -> list[Highlight]:
         except (TypeError, ValueError):
             score = 0.0
         result.append(Highlight(start, end, title[:60], reason[:200], score))
-        if len(result) == 7:
+        if len(result) == clip_count:
             break
-    if len(result) != 7:
-        raise ValueError(f"見どころが{len(result)}件しか返されませんでした")
+    if len(result) != clip_count:
+        raise ValueError(
+            f"見どころを{clip_count}件要求しましたが、{len(result)}件しか返されませんでした"
+        )
     return result
 
 
@@ -369,17 +373,20 @@ def build_highlight_prompts(
     transcript: list[TranscriptSegment],
     duration: float,
     custom_instructions: str = "",
+    clip_count: int = 7,
 ) -> tuple[str, str]:
+    if not 1 <= clip_count <= 20:
+        raise ValueError("作成本数は1〜20本で指定してください")
     transcript_text = transcript_as_text(transcript)
     instructions = custom_instructions.strip() or "指定なし。標準方針で選定する"
     system_prompt = (
         "あなたはYouTube Shortsの熟練編集者です。文字起こしから視聴維持率が高くなる場面を選びます。"
         "ユーザー指定は内容・雰囲気・長さの希望として優先しますが、"
-        "7件・有効なタイムスタンプ・JSON形式の条件は必ず守ってください。"
+        "指定された件数・有効なタイムスタンプ・JSON形式の条件は必ず守ってください。"
         "必ず有効なjsonだけを返してください。"
     )
     user_prompt = f"""
-動画の長さは {duration:.1f} 秒です。以下のタイムスタンプ付き文字起こしから、最も魅力的な見どころを必ず7個選んでください。
+動画の長さは {duration:.1f} 秒です。以下のタイムスタンプ付き文字起こしから、最も魅力的な見どころを必ず{clip_count}個選んでください。
 
 今回の編集方針（ユーザー指定）:
 {instructions}
@@ -407,6 +414,7 @@ def find_highlights_with_llm(
     provider_id: str = "openrouter",
     model: str = "openrouter/auto",
     custom_instructions: str = "",
+    clip_count: int = 7,
     callback: ProgressCallback | None = None,
 ) -> list[Highlight]:
     try:
@@ -420,7 +428,7 @@ def find_highlights_with_llm(
         raise AppError(str(exc)) from exc
 
     system_prompt, user_prompt = build_highlight_prompts(
-        transcript, duration, custom_instructions
+        transcript, duration, custom_instructions, clip_count
     )
 
     last_error: Exception | None = None
@@ -434,7 +442,7 @@ def find_highlights_with_llm(
                 user_prompt=user_prompt,
                 timeout=300,
             )
-            return normalize_highlights(_extract_json(content), duration)
+            return normalize_highlights(_extract_json(content), duration, clip_count)
         except LLMProviderError as exc:
             last_error = exc
             message = str(exc)
@@ -511,12 +519,15 @@ def run_pipeline(
     llm_provider: str = "openrouter",
     llm_model: str = "openrouter/auto",
     highlight_prompt: str = "",
+    clip_count: int = 7,
     resolution: str = "720p",
     cookie_browser: str | None = None,
     callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     if not re.match(r"^https?://", url.strip(), flags=re.IGNORECASE):
         raise AppError("YouTubeのURLを正しく入力してください。")
+    if not 1 <= clip_count <= 20:
+        raise AppError("作成本数は1〜20本で指定してください。")
     output_root.mkdir(parents=True, exist_ok=True)
     try:
         import imageio_ffmpeg
@@ -555,17 +566,22 @@ def run_pipeline(
             provider_id=llm_provider,
             model=llm_model,
             custom_instructions=highlight_prompt,
+            clip_count=clip_count,
             callback=callback,
         )
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         final_dir = output_root / f"{safe_filename(title)}_{stamp}"
         final_dir.mkdir(parents=True, exist_ok=False)
-        _notify(callback, "7本のShortsを書き出します…", 0.56)
+        _notify(callback, f"{clip_count}本のShortsを書き出します…", 0.56)
         for index, item in enumerate(highlights, start=1):
             filename = f"{index:02d}_{safe_filename(item.title, 45)}.mp4"
             output_path = final_dir / filename
-            _notify(callback, f"動画 {index}/7 を作成中: {item.title}", 0.55 + index * 0.06)
+            _notify(
+                callback,
+                f"動画 {index}/{clip_count} を作成中: {item.title}",
+                0.55 + (index / clip_count) * 0.42,
+            )
             cut_vertical_clip(
                 ffmpeg_path, video_path, output_path, item.start, item.end, resolution
             )
@@ -577,6 +593,7 @@ def run_pipeline(
             "transcript_source": transcript_source,
             "llm_provider": llm_provider,
             "llm_model": llm_model,
+            "clip_count": clip_count,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "highlights": [asdict(item) for item in highlights],
         }

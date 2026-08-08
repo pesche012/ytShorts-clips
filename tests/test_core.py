@@ -57,9 +57,9 @@ class CoreTests(unittest.TestCase):
                 for index in range(7)
             ]
         }
-        result = normalize_highlights(items, 300)
-        self.assertEqual(len(result), 7)
-        self.assertEqual(result[-1].title, "場面7")
+        result = normalize_highlights(items, 300, clip_count=3)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[-1].title, "場面3")
 
     def test_custom_highlight_prompt_is_included(self):
         custom_prompt = "テンポ重視で、30秒前後の場面を選ぶ"
@@ -67,13 +67,15 @@ class CoreTests(unittest.TestCase):
             [TranscriptSegment(0, 2, "テスト文字起こし")],
             120,
             custom_prompt,
+            clip_count=4,
         )
         self.assertIn(custom_prompt, user_prompt)
-        self.assertIn("必ず7個", user_prompt)
+        self.assertIn("必ず4個", user_prompt)
 
     def test_blank_highlight_prompt_uses_standard_policy(self):
         _, user_prompt = build_highlight_prompts([], 120, "  ")
         self.assertIn("指定なし。標準方針で選定する", user_prompt)
+        self.assertIn("必ず7個", user_prompt)
 
 
 if __name__ == "__main__":
