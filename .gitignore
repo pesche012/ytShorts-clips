@@ -1,0 +1,30 @@
+# Local Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local secrets and settings
+.env
+.env.*
+settings.json
+
+# Runtime logs and temporary downloads
+*.log
+*.part
+*.ytdl
+.youtube-short-*/
+
+# Generated media and reports
+outputs/
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.wav
+*.mp3
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
