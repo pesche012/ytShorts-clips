@@ -225,17 +225,29 @@ class ShortsApp(tk.Tk):
             style="Card.TLabel",
             foreground="#667085",
         ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(0, 14))
+        self.include_greeting_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            live_card,
+            text="冒頭の挨拶を入れる（なければ自然な導入から始める）",
+            variable=self.include_greeting_var,
+        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        self.preserve_ending_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            live_card,
+            text="締めを優先（指定時間を少し超えても、最後の発言や挨拶を全部入れる）",
+            variable=self.preserve_ending_var,
+        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(0, 12))
         ttk.Label(
             live_card,
             text="配信中は現在位置から指定分だけ取得します。終了済み配信はアーカイブ全体を編集します。",
             style="Card.TLabel",
-        ).grid(row=7, column=0, columnspan=4, sticky="w")
+        ).grid(row=9, column=0, columnspan=4, sticky="w")
         ttk.Label(
             live_card,
             text="OpenRouter・モデル・Whisper・画質・ログイン設定は「通常動画」タブの設定を使用します。",
             style="Card.TLabel",
             foreground="#667085",
-        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(4, 0))
         for column in range(4):
             live_card.columnconfigure(column, weight=1)
 
@@ -302,6 +314,8 @@ class ShortsApp(tk.Tk):
                 target_minutes, capture_minutes = 1.0, 30
             self.live_target_minutes_var.set(min(30, max(0.5, target_minutes)))
             self.live_capture_minutes_var.set(min(360, max(1, capture_minutes)))
+            self.preserve_ending_var.set(bool(data.get("preserve_live_ending", True)))
+            self.include_greeting_var.set(bool(data.get("include_live_greeting", True)))
         except SecureStorageError as exc:
             self.after(100, lambda message=str(exc): messagebox.showerror(APP_NAME, message))
 
@@ -316,6 +330,8 @@ class ShortsApp(tk.Tk):
             "clip_count": self.clip_count_var.get(),
             "live_target_minutes": live_target_minutes,
             "live_capture_minutes": self.live_capture_minutes_var.get(),
+            "preserve_live_ending": self.preserve_ending_var.get(),
+            "include_live_greeting": self.include_greeting_var.get(),
             "llm_provider": self._provider_id(),
             "llm_model": self._selected_model_id(),
         }
@@ -440,6 +456,8 @@ class ShortsApp(tk.Tk):
         provider_id = self._provider_id()
         model = self._selected_model_id()
         edit_prompt = self.live_edit_prompt.get("1.0", "end-1c").strip()
+        preserve_ending = self.preserve_ending_var.get()
+        include_greeting = self.include_greeting_var.get()
         try:
             target_minutes = float(self.live_target_minutes_var.get())
             capture_minutes = int(self.live_capture_minutes_var.get())
@@ -489,6 +507,8 @@ class ShortsApp(tk.Tk):
                     llm_provider=provider_id,
                     llm_model=model,
                     edit_prompt=edit_prompt,
+                    preserve_ending=preserve_ending,
+                    include_greeting=include_greeting,
                     resolution=resolution,
                     cookie_browser=browser,
                     callback=callback,
@@ -516,9 +536,9 @@ class ShortsApp(tk.Tk):
                     self.open_button.configure(state="normal")
                     self.progress["value"] = 100
                     if result.get("mode") == "live_edit":
-                        target_seconds = int(result["target_duration"])
-                        target_minutes = target_seconds / 60
-                        duration_label = f"{target_minutes:g}分"
+                        output_seconds = float(result.get("output_duration") or result["target_duration"])
+                        output_minutes = output_seconds / 60
+                        duration_label = f"{output_minutes:.1f}".rstrip("0").rstrip(".") + "分"
                         self.status_var.set(f"完成しました。{duration_label}の動画を確認できます。")
                         messagebox.showinfo(
                             APP_NAME,

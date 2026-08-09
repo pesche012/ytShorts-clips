@@ -477,9 +477,23 @@ def build_live_edit_prompts(
     duration: float,
     target_seconds: int,
     custom_instructions: str = "",
+    preserve_ending: bool = True,
+    include_greeting: bool = True,
 ) -> tuple[str, str]:
     transcript_text = transcript_as_text(transcript)
     instructions = custom_instructions.strip() or "指定なし。盛り上がりと分かりやすさを優先する"
+    ending_rule = (
+        "最後の区間は、締めの発言・結論・挨拶・笑い・余韻が完全に終わるまで含める。"
+        "時間を少し超えても途中で切らない"
+        if preserve_ending
+        else "完成時間を優先し、最後の区間も指定時間内に収める"
+    )
+    intro_rule = (
+        "最初の区間には、元配信にある冒頭の挨拶・自己紹介・開始宣言を含める。"
+        "挨拶がない場合も、話の途中ではなく自然な導入から始める"
+        if include_greeting
+        else "最初から見どころを優先して始める"
+    )
     system_prompt = (
         "あなたは生配信の切り抜きを作る熟練動画編集者です。"
         "退屈な間、無言、重複、脱線を除き、見どころだけで自然につながる1本を設計します。"
@@ -493,9 +507,11 @@ def build_live_edit_prompts(
 
 条件:
 - highlightsの合計時間は {target_seconds} 秒以上、{target_seconds + 30} 秒以内にする
+- {intro_rule}
 - 各区間は原則8〜90秒で、話の途中から始めず結論の直後で終える
 - 無言、待ち時間、同じ話、内輪だけのやり取り、不要な脱線を除く
 - 1本の動画として導入・展開・結論が自然につながるようにする
+- {ending_rule}
 - 区間を重複させず、元動画での時系列順に並べる
 - startとendは元動画先頭からの秒数（数値）
 - titleとreasonは日本語、scoreは重要度を0〜100で評価
@@ -558,6 +574,60 @@ def normalize_live_edit_segments(
     return result
 
 
+_GREETING_PATTERN = re.compile(
+    r"(?:こんにちは|こんばんは|おはよう|どうも[、,!！ ]|よろしくお願いします|"
+    r"始めていきましょう|配信を始め|今日もよろしく)",
+    flags=re.IGNORECASE,
+)
+
+
+def ensure_greeting_segment(
+    transcript: list[TranscriptSegment],
+    segments: list[Highlight],
+    duration: float,
+    include_greeting: bool = True,
+) -> list[Highlight]:
+    if not include_greeting or not transcript:
+        return segments
+    search_limit = min(duration * 0.2, 600)
+    greeting_index = next(
+        (
+            index
+            for index, item in enumerate(transcript)
+            if item.start <= search_limit and _GREETING_PATTERN.search(item.text)
+        ),
+        None,
+    )
+    if greeting_index is None:
+        return segments
+    greeting_source = transcript[greeting_index]
+    greeting_start = max(0.0, greeting_source.start - 1.0)
+    greeting_end = min(duration, greeting_source.end + 3.0)
+    for item in transcript[greeting_index + 1 :]:
+        if item.start > greeting_source.end + 12:
+            break
+        greeting_end = min(duration, item.end)
+        if greeting_end >= greeting_source.end + 8:
+            break
+
+    result = list(segments)
+    for item in result:
+        if item.start <= greeting_end and item.end >= greeting_start:
+            item.start = min(item.start, greeting_start)
+            item.end = max(item.end, greeting_end)
+            return sorted(result, key=lambda value: value.start)
+    result.append(
+        Highlight(
+            start=greeting_start,
+            end=greeting_end,
+            title="冒頭の挨拶",
+            reason="動画が唐突に始まらないよう、元配信の挨拶を含める",
+            score=100,
+        )
+    )
+    return sorted(result, key=lambda value: value.start)
+
+
 def find_live_edit_segments_with_llm(
     transcript: list[TranscriptSegment],
     duration: float,
@@ -566,6 +636,8 @@ def find_live_edit_segments_with_llm(
     provider_id: str,
     model: str,
     custom_instructions: str = "",
+    preserve_ending: bool = True,
+    include_greeting: bool = True,
     callback: ProgressCallback | None = None,
 ) -> list[Highlight]:
     try:
@@ -574,7 +646,12 @@ def find_live_edit_segments_with_llm(
         raise AppError("LLM接続モジュールが見つかりません。アプリを再インストールしてください。") from exc
     provider = get_provider(provider_id)
     system_prompt, user_prompt = build_live_edit_prompts(
-        transcript, duration, target_seconds, custom_instructions
+        transcript,
+        duration,
+        target_seconds,
+        custom_instructions,
+        preserve_ending,
+        include_greeting,
     )
     last_error: Exception | None = None
     for attempt in range(1, 4):
@@ -588,8 +665,11 @@ def find_live_edit_segments_with_llm(
                 timeout=300,
                 json_schema=build_highlights_schema(1, 30),
             )
-            return normalize_live_edit_segments(
+            segments = normalize_live_edit_segments(
                 _extract_json(content), duration, target_seconds
+            )
+            return ensure_greeting_segment(
+                transcript, segments, duration, include_greeting
             )
         except LLMProviderError as exc:
             last_error = exc
@@ -824,6 +904,7 @@ def create_live_montage(
     target_seconds: int,
     resolution: str,
     work_dir: Path,
+    preserve_ending: bool = True,
     callback: ProgressCallback | None = None,
 ) -> None:
     parts_dir = work_dir / "live_parts"
@@ -853,7 +934,11 @@ def create_live_montage(
     )
     _notify(
         callback,
-        f"不要部分を除き、{format_duration_label(target_seconds)}の動画へまとめています…",
+        (
+            f"不要部分を除き、締めを最後まで含めた約{format_duration_label(target_seconds)}の動画へまとめています…"
+            if preserve_ending
+            else f"不要部分を除き、{format_duration_label(target_seconds)}の動画へまとめています…"
+        ),
         0.88,
     )
     command = [
@@ -868,8 +953,10 @@ def create_live_montage(
         "0",
         "-i",
         str(concat_path),
-        "-t",
-        str(target_seconds),
+    ]
+    if not preserve_ending:
+        command.extend(["-t", str(target_seconds)])
+    command.extend([
         "-c:v",
         "libx264",
         "-preset",
@@ -883,7 +970,7 @@ def create_live_montage(
         "-movflags",
         "+faststart",
         str(output_path),
-    ]
+    ])
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     completed = subprocess.run(command, capture_output=True, text=True, creationflags=creationflags)
     if completed.returncode != 0:
@@ -901,6 +988,8 @@ def run_live_edit_pipeline(
     llm_provider: str = "openrouter",
     llm_model: str = "openrouter/auto",
     edit_prompt: str = "",
+    preserve_ending: bool = True,
+    include_greeting: bool = True,
     resolution: str = "720p",
     cookie_browser: str | None = None,
     callback: ProgressCallback | None = None,
@@ -983,6 +1072,8 @@ def run_live_edit_pipeline(
             provider_id=llm_provider,
             model=llm_model,
             custom_instructions=edit_prompt,
+            preserve_ending=preserve_ending,
+            include_greeting=include_greeting,
             callback=callback,
         )
 
@@ -990,7 +1081,8 @@ def run_live_edit_pipeline(
         final_dir = output_root / f"{safe_filename(title)}_生配信編集_{stamp}"
         final_dir.mkdir(parents=True, exist_ok=False)
         duration_label = format_duration_label(target_seconds)
-        output_path = final_dir / f"生配信切り抜き_{duration_label}.mp4"
+        filename_prefix = "生配信切り抜き_約" if preserve_ending else "生配信切り抜き_"
+        output_path = final_dir / f"{filename_prefix}{duration_label}.mp4"
         create_live_montage(
             ffmpeg_path=ffmpeg_path,
             video_path=video_path,
@@ -999,8 +1091,10 @@ def run_live_edit_pipeline(
             target_seconds=target_seconds,
             resolution=resolution,
             work_dir=work_dir,
+            preserve_ending=preserve_ending,
             callback=callback,
         )
+        output_duration = probe_video_duration(ffmpeg_path, output_path)
         report = {
             "mode": "live_edit",
             "source_url": url.strip(),
@@ -1009,6 +1103,10 @@ def run_live_edit_pipeline(
             "source_duration": duration,
             "target_duration": target_seconds,
             "target_duration_minutes": target_seconds / 60,
+            "output_duration": output_duration,
+            "output_duration_minutes": output_duration / 60,
+            "preserve_ending": preserve_ending,
+            "include_greeting": include_greeting,
             "transcript_source": transcript_source,
             "llm_provider": llm_provider,
             "llm_model": llm_model,

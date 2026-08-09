@@ -8,10 +8,12 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import (
+    Highlight,
     TranscriptSegment,
     build_highlight_prompts,
     build_live_edit_prompts,
     format_duration_label,
+    ensure_greeting_segment,
     normalize_highlights,
     normalize_live_edit_segments,
     parse_json3,
@@ -89,6 +91,8 @@ class CoreTests(unittest.TestCase):
         )
         self.assertIn("90 秒", user_prompt)
         self.assertIn("ゲームの勝負どころを優先", user_prompt)
+        self.assertIn("時間を少し超えても途中で切らない", user_prompt)
+        self.assertIn("冒頭の挨拶", user_prompt)
 
     def test_live_edit_segments_cover_target_duration(self):
         data = {
@@ -104,6 +108,17 @@ class CoreTests(unittest.TestCase):
     def test_duration_label_uses_minutes(self):
         self.assertEqual(format_duration_label(60), "1分")
         self.assertEqual(format_duration_label(90), "1.5分")
+
+    def test_greeting_is_added_before_selected_segments(self):
+        transcript = [
+            TranscriptSegment(2, 4, "こんばんは、配信を始めます"),
+            TranscriptSegment(4, 10, "今日はゲームをします"),
+            TranscriptSegment(30, 50, "最初の見どころ"),
+        ]
+        segments = [Highlight(30, 50, "見どころ", "理由")]
+        result = ensure_greeting_segment(transcript, segments, duration=60)
+        self.assertEqual(result[0].title, "冒頭の挨拶")
+        self.assertLess(result[0].start, result[1].start)
 
 
 if __name__ == "__main__":
