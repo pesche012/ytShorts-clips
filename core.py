@@ -13,6 +13,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from candidate_models import (
+    CandidateProject,
+    ClipCandidate,
+    ScoreDetail,
+    load_candidate_project,
+    save_candidate_project,
+)
+from scoring import ScoringProfile, YOUTUBE_SHORTS_PROFILE, build_candidate_schema
+
 
 ProgressCallback = Callable[[str, float | None], None]
 CancelCallback = Callable[[], bool]
@@ -534,6 +543,199 @@ def find_highlights_with_llm(
     raise AppError(f"LLMから見どころを取得できませんでした。\n{last_error}")
 
 
+def transcript_excerpt(
+    transcript: Iterable[TranscriptSegment],
+    start: float,
+    end: float,
+) -> str:
+    return " ".join(
+        item.text.strip()
+        for item in transcript
+        if item.text.strip() and item.end > start and item.start < end
+    ).strip()
+
+
+def normalize_clip_candidates(
+    data: Any,
+    duration: float,
+    transcript: list[TranscriptSegment],
+    source_path: Path | str,
+    clip_count: int = 7,
+    profile: ScoringProfile = YOUTUBE_SHORTS_PROFILE,
+) -> list[ClipCandidate]:
+    if not 1 <= clip_count <= 20:
+        raise ValueError("候補数は1〜20本で指定してください")
+    items = data.get("highlights") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise ValueError("highlights配列がありません")
+    result: list[ClipCandidate] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = max(0.0, parse_timestamp(item.get("start", 0)))
+            end = min(duration, parse_timestamp(item.get("end", start + 30)))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        if end - start > 60:
+            end = start + 60
+        if end - start < 10:
+            center = (start + end) / 2
+            start = max(0.0, center - 7.5)
+            end = min(duration, start + 15)
+            start = max(0.0, end - 15)
+
+        raw_criteria = item.get("criteria") if isinstance(item.get("criteria"), dict) else {}
+        fallback_score = item.get("score", 0)
+        fallback_reason = str(item.get("reason") or item.get("score_reason") or "評価理由なし").strip()
+        details: dict[str, ScoreDetail] = {}
+        numeric_scores: dict[str, float] = {}
+        for criterion in profile.criteria:
+            raw_detail = raw_criteria.get(criterion.key, {})
+            if not isinstance(raw_detail, dict):
+                raw_detail = {}
+            try:
+                value = float(raw_detail.get("score", fallback_score))
+            except (TypeError, ValueError):
+                value = 0.0
+            value = max(0.0, min(100.0, value))
+            reason = str(raw_detail.get("reason") or fallback_reason).strip()[:160]
+            numeric_scores[criterion.key] = value
+            details[criterion.key] = ScoreDetail(value, reason, criterion.label)
+
+        total = profile.calculate_total(numeric_scores)
+        title = str(item.get("title") or f"見どころ {index + 1}").strip()[:60]
+        score_reason = str(item.get("score_reason") or item.get("reason") or fallback_reason).strip()[:240]
+        result.append(
+            ClipCandidate(
+                candidate_id=f"candidate-{index + 1:03d}",
+                start=start,
+                end=end,
+                title=title,
+                score=total,
+                score_reason=score_reason,
+                transcript=transcript_excerpt(transcript, start, end),
+                source_path=str(Path(source_path).resolve()),
+                scoring_profile_id=profile.profile_id,
+                criteria=details,
+            )
+        )
+        if len(result) == clip_count:
+            break
+    if len(result) != clip_count:
+        raise ValueError(
+            f"切り抜き候補を{clip_count}件要求しましたが、{len(result)}件しか返されませんでした"
+        )
+    return sorted(result, key=lambda item: item.score, reverse=True)
+
+
+def build_candidate_prompts(
+    transcript: list[TranscriptSegment],
+    duration: float,
+    custom_instructions: str = "",
+    clip_count: int = 7,
+    profile: ScoringProfile = YOUTUBE_SHORTS_PROFILE,
+) -> tuple[str, str]:
+    if not 1 <= clip_count <= 20:
+        raise ValueError("候補数は1〜20本で指定してください")
+    instructions = custom_instructions.strip() or "指定なし。標準方針で選定する"
+    criteria_json = ",".join(
+        f'"{criterion.key}":{{"score":85,"reason":"短い理由"}}'
+        for criterion in profile.criteria
+    )
+    criteria_labels = "\n".join(
+        f"- {criterion.key}: {criterion.label}（重み {criterion.weight:g}）"
+        for criterion in profile.criteria
+    )
+    system_prompt = (
+        "あなたはYouTube Shortsの熟練編集者兼スコア審査員です。"
+        "候補区間を選び、各評価項目を0〜100点で独立して採点してください。"
+        "甘い採点を避け、50点以下の弱い候補も必要に応じて含めて差を明確にします。"
+        "指定件数、有効なタイムスタンプ、JSON形式を必ず守ってください。"
+    )
+    user_prompt = f"""
+動画の長さは {duration:.1f} 秒です。以下の文字起こしから切り抜き候補を必ず{clip_count}個選んでください。
+
+今回の編集方針（ユーザー指定）:
+{instructions}
+
+採点方式: {profile.label}（{profile.profile_id}）
+{criteria_labels}
+
+条件:
+- 各候補は原則15〜60秒。話の途中から始めず、オチや結論の直後で終える
+- 同じ内容・時間帯を重複させない
+- 単体でも内容が分かり、冒頭に強い引きがある場面を優先
+- 各項目は0〜100点で採点し、理由は日本語で短く具体的にする
+- score_reasonには候補全体の短い評価理由を書く
+- startとendは動画先頭からの秒数（数値）
+- 結果は次のJSON形式のみ:
+{{"highlights":[{{"start":12.3,"end":48.0,"title":"短いタイトル","score_reason":"総合的な評価理由","criteria":{{{criteria_json}}}}}]}}
+
+文字起こし:
+{transcript_as_text(transcript)}
+""".strip()
+    return system_prompt, user_prompt
+
+
+def find_clip_candidates_with_llm(
+    transcript: list[TranscriptSegment],
+    duration: float,
+    source_path: Path | str,
+    api_key: str,
+    provider_id: str = "openrouter",
+    model: str = "openrouter/auto",
+    custom_instructions: str = "",
+    clip_count: int = 7,
+    profile: ScoringProfile = YOUTUBE_SHORTS_PROFILE,
+    callback: ProgressCallback | None = None,
+    cancel_check: CancelCallback | None = None,
+) -> list[ClipCandidate]:
+    _check_cancel(cancel_check)
+    try:
+        from llm_providers import LLMProviderError, get_provider
+    except ImportError as exc:
+        raise AppError("LLM接続モジュールが見つかりません。アプリを再インストールしてください。") from exc
+    try:
+        provider = get_provider(provider_id)
+    except LLMProviderError as exc:
+        raise AppError(str(exc)) from exc
+    system_prompt, user_prompt = build_candidate_prompts(
+        transcript, duration, custom_instructions, clip_count, profile
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        _check_cancel(cancel_check)
+        _notify(callback, f"{provider.display_name} / {model} が候補を採点しています…（{attempt}/3）", 0.58)
+        try:
+            content = provider.complete_json(
+                api_key=api_key,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                timeout=300,
+                json_schema=build_candidate_schema(clip_count, clip_count, profile),
+            )
+            _check_cancel(cancel_check)
+            return normalize_clip_candidates(
+                _extract_json(content), duration, transcript, source_path, clip_count, profile
+            )
+        except AppCancelled:
+            raise
+        except LLMProviderError as exc:
+            last_error = exc
+            message = str(exc)
+            if any(word in message for word in ("APIキー", "残高", "利用上限", "未対応")):
+                raise AppError(message) from exc
+        except Exception as exc:
+            last_error = exc
+        if attempt < 3:
+            _wait_with_cancel(1.5 * attempt, cancel_check)
+    raise AppError(f"LLMから採点済み候補を取得できませんでした。\n{last_error}")
+
+
 def build_live_edit_prompts(
     transcript: list[TranscriptSegment],
     duration: float,
@@ -947,6 +1149,292 @@ def run_pipeline(
         (final_dir / "文字起こし.txt").write_text(transcript_as_text(transcript), encoding="utf-8")
         _notify(callback, "完了しました。", 1.0)
         return {"output_dir": str(final_dir), **report}
+
+
+def analyze_file_candidates(
+    video_file: Path | str,
+    api_key: str,
+    output_root: Path,
+    whisper_model: str = "small",
+    llm_provider: str = "openrouter",
+    llm_model: str = "openrouter/auto",
+    highlight_prompt: str = "",
+    clip_count: int = 7,
+    scoring_profile: ScoringProfile = YOUTUBE_SHORTS_PROFILE,
+    callback: ProgressCallback | None = None,
+    cancel_check: CancelCallback | None = None,
+) -> dict[str, Any]:
+    """Analyze and persist candidates without creating final video files."""
+    _check_cancel(cancel_check)
+    video_path = Path(video_file).expanduser().resolve()
+    if not video_path.is_file():
+        raise AppError("選択した動画ファイルが見つかりません。")
+    if not 1 <= clip_count <= 20:
+        raise AppError("候補数は1〜20本で指定してください。")
+    output_root.mkdir(parents=True, exist_ok=True)
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        raise AppError("動画処理エンジンを準備できません。setup.batをもう一度実行してください。") from exc
+
+    _notify(callback, "動画ファイルを確認しています…", 0.02)
+    duration = probe_video_duration(ffmpeg_path, video_path)
+    _check_cancel(cancel_check)
+    if duration <= 0:
+        raise AppError("動画の長さを取得できませんでした。対応している動画ファイルを選んでください。")
+
+    _notify(callback, "動画の音声をWhisperで文字起こしします…", 0.08)
+    transcript = transcribe_with_whisper(video_path, whisper_model, callback, cancel_check)
+    transcript_source = "Whisper（動画ファイル）"
+    title = video_path.stem or "local_video"
+    candidates = find_clip_candidates_with_llm(
+        transcript=transcript,
+        duration=duration,
+        source_path=video_path,
+        api_key=api_key,
+        provider_id=llm_provider,
+        model=llm_model,
+        custom_instructions=highlight_prompt,
+        clip_count=clip_count,
+        profile=scoring_profile,
+        callback=callback,
+        cancel_check=cancel_check,
+    )
+
+    _check_cancel(cancel_check)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    final_dir = output_root / f"{safe_filename(title)}_候補_{stamp}"
+    final_dir.mkdir(parents=True, exist_ok=False)
+    candidate_file = final_dir / "切り抜き候補.json"
+    try:
+        project = CandidateProject(
+            project_id=f"{safe_filename(title)}-{stamp}",
+            created_at=datetime.now().isoformat(timespec="seconds"),
+            source_path=str(video_path),
+            source_file_name=video_path.name,
+            video_title=title,
+            video_duration=duration,
+            transcript_source=transcript_source,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            scoring_profile_id=scoring_profile.profile_id,
+            candidates=candidates,
+        )
+        save_candidate_project(candidate_file, project)
+        (final_dir / "文字起こし.txt").write_text(
+            transcript_as_text(transcript), encoding="utf-8"
+        )
+        _check_cancel(cancel_check)
+        _notify(callback, "候補の採点が完了しました。選んだ候補だけ動画にできます。", 1.0)
+        return {
+            "mode": "candidate_analysis",
+            "output_dir": str(final_dir),
+            "candidate_file": str(candidate_file),
+            "candidate_count": len(candidates),
+            "project": project.to_dict(),
+        }
+    except Exception:
+        shutil.rmtree(final_dir, ignore_errors=True)
+        raise
+
+
+def encode_selected_candidates(
+    candidate_file: Path | str,
+    selected_candidate_ids: Iterable[str],
+    resolution: str = "720p",
+    callback: ProgressCallback | None = None,
+    cancel_check: CancelCallback | None = None,
+) -> dict[str, Any]:
+    """Encode only explicitly selected candidates from a saved project."""
+    _check_cancel(cancel_check)
+    candidate_path = Path(candidate_file).resolve()
+    try:
+        project = load_candidate_project(candidate_path)
+    except ValueError as exc:
+        raise AppError(str(exc)) from exc
+    selected_ids = {str(item) for item in selected_candidate_ids}
+    if not selected_ids:
+        raise AppError("動画にする候補を1本以上選択してください。")
+    selected = [item for item in project.candidates if item.candidate_id in selected_ids]
+    if len(selected) != len(selected_ids):
+        raise AppError("候補ファイルに存在しない項目が選択されています。候補を読み直してください。")
+    video_path = Path(project.source_path)
+    if not video_path.is_file():
+        raise AppError("元動画が見つかりません。候補作成時と同じ場所に動画を置いてください。")
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        raise AppError("動画処理エンジンを準備できません。setup.batをもう一度実行してください。") from exc
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = candidate_path.parent / f"選択Shorts_{stamp}"
+    output_dir.mkdir(parents=True, exist_ok=False)
+    encoded: dict[str, str] = {}
+    try:
+        total = len(selected)
+        _notify(callback, f"選択した{total}本だけを書き出します…", 0.02)
+        for index, item in enumerate(selected, start=1):
+            _check_cancel(cancel_check)
+            output_path = output_dir / (
+                f"{index:02d}_{round(item.score):03d}点_{safe_filename(item.title, 40)}.mp4"
+            )
+            _notify(
+                callback,
+                f"動画 {index}/{total} を作成中: {item.title}",
+                0.02 + (index / total) * 0.94,
+            )
+            cut_vertical_clip(
+                ffmpeg_path,
+                video_path,
+                output_path,
+                item.start,
+                item.end,
+                resolution,
+                cancel_check,
+            )
+            encoded[item.candidate_id] = str(output_path)
+
+        _check_cancel(cancel_check)
+        decision_time = datetime.now().isoformat(timespec="seconds")
+        for item in project.candidates:
+            if item.candidate_id in selected_ids:
+                item.decision = "adopted"
+                item.encoded_file = encoded[item.candidate_id]
+            else:
+                item.decision = "rejected"
+        project.selection_history.append(
+            {
+                "selected_candidate_ids": [item.candidate_id for item in selected],
+                "encoded_at": decision_time,
+                "resolution": resolution,
+                "output_dir": str(output_dir),
+            }
+        )
+        save_candidate_project(candidate_path, project)
+        report = {
+            "mode": "candidate_encode",
+            "candidate_file": str(candidate_path),
+            "source_file_name": project.source_file_name,
+            "clip_count": total,
+            "resolution": resolution,
+            "created_at": decision_time,
+            "encoded_candidates": [
+                {**item.to_dict(), "output_file": encoded[item.candidate_id]}
+                for item in selected
+            ],
+        }
+        (output_dir / "エンコード結果.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        _notify(callback, "選択した候補の動画が完成しました。", 1.0)
+        return {"output_dir": str(output_dir), **report}
+    except Exception:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        raise
+
+
+def create_candidate_preview(
+    candidate_file: Path | str,
+    candidate_id: str,
+    cancel_check: CancelCallback | None = None,
+) -> Path:
+    """Create a reusable low-resolution preview only when the user asks for it."""
+    candidate_path = Path(candidate_file).resolve()
+    try:
+        project = load_candidate_project(candidate_path)
+    except ValueError as exc:
+        raise AppError(str(exc)) from exc
+    candidate = next(
+        (item for item in project.candidates if item.candidate_id == candidate_id),
+        None,
+    )
+    if candidate is None:
+        raise AppError("選択した候補が見つかりません。")
+    source_path = Path(project.source_path)
+    if not source_path.is_file():
+        raise AppError("元動画が見つかりません。候補作成時と同じ場所に動画を置いてください。")
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        raise AppError("動画処理エンジンを準備できません。setup.batをもう一度実行してください。") from exc
+    preview_dir = candidate_path.parent / ".previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    output_path = preview_dir / f"{safe_filename(candidate.candidate_id)}.mp4"
+    if output_path.is_file() and output_path.stat().st_size > 0:
+        return output_path
+    duration = max(0.1, candidate.end - candidate.start)
+    command = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{candidate.start:.3f}",
+        "-i",
+        str(source_path),
+        "-t",
+        f"{duration:.3f}",
+        "-vf",
+        "scale=-2:480,format=yuv420p",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "30",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "96k",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    try:
+        completed = _run_cancellable_command(command, cancel_check)
+        if completed.returncode != 0:
+            message = (completed.stderr or "プレビュー作成に失敗しました").strip()
+            raise AppError(f"プレビューを作成できませんでした。\n{message[-800:]}")
+        return output_path
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
+
+
+def delete_candidate_previews(candidate_file: Path | str) -> tuple[int, int]:
+    """Delete only generated previews for one saved candidate project."""
+    candidate_path = Path(candidate_file).resolve()
+    try:
+        load_candidate_project(candidate_path)
+    except ValueError as exc:
+        raise AppError(str(exc)) from exc
+    preview_dir = candidate_path.parent / ".previews"
+    if not preview_dir.exists():
+        return 0, 0
+    if preview_dir.is_symlink() or not preview_dir.is_dir():
+        raise AppError("プレビューフォルダーの形式が正しくないため、安全のため削除を中止しました。")
+    file_count = 0
+    total_bytes = 0
+    for path in preview_dir.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            file_count += 1
+            try:
+                total_bytes += path.stat().st_size
+            except OSError:
+                pass
+    shutil.rmtree(preview_dir)
+    return file_count, total_bytes
 
 
 def run_file_pipeline(

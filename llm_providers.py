@@ -171,7 +171,8 @@ class OpenRouterProvider(LLMProvider):
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.2,
-            "max_tokens": 4000,
+            # Twenty candidates with six scored criteria can exceed 4,000 tokens.
+            "max_tokens": 12000,
             "stream": False,
         }
         last_response = None
