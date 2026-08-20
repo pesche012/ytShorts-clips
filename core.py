@@ -15,10 +15,15 @@ from typing import Any, Callable, Iterable
 
 
 ProgressCallback = Callable[[str, float | None], None]
+CancelCallback = Callable[[], bool]
 
 
 class AppError(RuntimeError):
     """An error that can be shown to the user without a traceback."""
+
+
+class AppCancelled(AppError):
+    """Raised when the user requests cancellation."""
 
 
 @dataclass
@@ -40,6 +45,49 @@ class Highlight:
 def _notify(callback: ProgressCallback | None, message: str, progress: float | None = None) -> None:
     if callback:
         callback(message, progress)
+
+
+def _check_cancel(cancel_check: CancelCallback | None) -> None:
+    if cancel_check and cancel_check():
+        raise AppCancelled("処理をキャンセルしました。")
+
+
+def _wait_with_cancel(seconds: float, cancel_check: CancelCallback | None) -> None:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline:
+        _check_cancel(cancel_check)
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    _check_cancel(cancel_check)
+
+
+def _run_cancellable_command(
+    command: list[str],
+    cancel_check: CancelCallback | None = None,
+) -> subprocess.CompletedProcess[str]:
+    _check_cancel(cancel_check)
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        creationflags=creationflags,
+    )
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=0.2)
+            _check_cancel(cancel_check)
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            if not (cancel_check and cancel_check()):
+                continue
+            process.terminate()
+            try:
+                process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            raise AppCancelled("処理をキャンセルしました。")
 
 
 def safe_filename(value: str, max_length: int = 70) -> str:
@@ -138,7 +186,7 @@ def _deduplicate_segments(segments: Iterable[TranscriptSegment]) -> list[Transcr
     return result
 
 
-def _youtube_options(ffmpeg_path: str, cookie_browser: str | None = None) -> dict[str, Any]:
+def _youtube_options(ffmpeg_path: str) -> dict[str, Any]:
     options: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -154,18 +202,16 @@ def _youtube_options(ffmpeg_path: str, cookie_browser: str | None = None) -> dic
         deno_path = next((str(path) for path in candidates if path.is_file()), None)
     if deno_path:
         options["js_runtimes"] = {"deno": {"path": deno_path}}
-    if cookie_browser:
-        options["cookiesfrombrowser"] = (cookie_browser,)
     return options
 
 
-def fetch_metadata(url: str, ffmpeg_path: str, cookie_browser: str | None = None) -> dict[str, Any]:
+def fetch_metadata(url: str, ffmpeg_path: str) -> dict[str, Any]:
     try:
         import yt_dlp
     except ImportError as exc:
         raise AppError("yt-dlpが見つかりません。setup.batをもう一度実行してください。") from exc
 
-    options = _youtube_options(ffmpeg_path, cookie_browser)
+    options = _youtube_options(ffmpeg_path)
     options["skip_download"] = True
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -199,7 +245,6 @@ def download_caption(
     info: dict[str, Any],
     work_dir: Path,
     ffmpeg_path: str,
-    cookie_browser: str | None = None,
 ) -> tuple[list[TranscriptSegment], str] | None:
     choice = _choose_caption(info)
     if not choice:
@@ -207,7 +252,7 @@ def download_caption(
     language, kind = choice
     import yt_dlp
 
-    options = _youtube_options(ffmpeg_path, cookie_browser)
+    options = _youtube_options(ffmpeg_path)
     options.update(
         {
             "skip_download": True,
@@ -239,15 +284,16 @@ def download_video(
     url: str,
     work_dir: Path,
     ffmpeg_path: str,
-    cookie_browser: str | None,
     callback: ProgressCallback | None,
     max_duration_seconds: float | None = None,
+    cancel_check: CancelCallback | None = None,
 ) -> Path:
     import yt_dlp
 
-    options = _youtube_options(ffmpeg_path, cookie_browser)
+    options = _youtube_options(ffmpeg_path)
 
     def hook(status: dict[str, Any]) -> None:
+        _check_cancel(cancel_check)
         if status.get("status") == "downloading":
             total = status.get("total_bytes") or status.get("total_bytes_estimate")
             downloaded = status.get("downloaded_bytes", 0)
@@ -275,10 +321,13 @@ def download_video(
         except ImportError as exc:
             raise AppError("生配信の時間指定に対応したyt-dlpが必要です。setup.batを実行してください。") from exc
     try:
+        _check_cancel(cancel_check)
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.extract_info(url, download=True)
     except Exception as exc:
+        _check_cancel(cancel_check)
         raise AppError(f"動画をダウンロードできませんでした。\n{exc}") from exc
+    _check_cancel(cancel_check)
 
     candidates = [
         path
@@ -294,7 +343,9 @@ def transcribe_with_whisper(
     video_path: Path,
     model_name: str,
     callback: ProgressCallback | None = None,
+    cancel_check: CancelCallback | None = None,
 ) -> list[TranscriptSegment]:
+    _check_cancel(cancel_check)
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
@@ -303,6 +354,7 @@ def transcribe_with_whisper(
     _notify(callback, f"Whisper（{model_name}）を準備しています…", 0.28)
     try:
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        _check_cancel(cancel_check)
         stream, _ = model.transcribe(
             str(video_path),
             beam_size=5,
@@ -311,13 +363,17 @@ def transcribe_with_whisper(
         )
         result: list[TranscriptSegment] = []
         for index, segment in enumerate(stream, start=1):
+            _check_cancel(cancel_check)
             text = segment.text.strip()
             if text:
                 result.append(TranscriptSegment(float(segment.start), float(segment.end), text))
             if index % 10 == 0:
                 _notify(callback, f"Whisperで文字起こし中… {seconds_to_timestamp(segment.end)}", 0.32)
+    except AppCancelled:
+        raise
     except Exception as exc:
         raise AppError(f"Whisperの文字起こしに失敗しました。\n{exc}") from exc
+    _check_cancel(cancel_check)
     if not result:
         raise AppError("音声から文字を検出できませんでした。")
     return result
@@ -432,7 +488,9 @@ def find_highlights_with_llm(
     custom_instructions: str = "",
     clip_count: int = 7,
     callback: ProgressCallback | None = None,
+    cancel_check: CancelCallback | None = None,
 ) -> list[Highlight]:
+    _check_cancel(cancel_check)
     try:
         from llm_providers import LLMProviderError, build_highlights_schema, get_provider
     except ImportError as exc:
@@ -449,6 +507,7 @@ def find_highlights_with_llm(
 
     last_error: Exception | None = None
     for attempt in range(1, 4):
+        _check_cancel(cancel_check)
         _notify(callback, f"{provider.display_name} / {model} が見どころを選んでいます…（{attempt}/3）", 0.48)
         try:
             content = provider.complete_json(
@@ -459,7 +518,10 @@ def find_highlights_with_llm(
                 timeout=300,
                 json_schema=build_highlights_schema(clip_count, clip_count),
             )
+            _check_cancel(cancel_check)
             return normalize_highlights(_extract_json(content), duration, clip_count)
+        except AppCancelled:
+            raise
         except LLMProviderError as exc:
             last_error = exc
             message = str(exc)
@@ -468,7 +530,7 @@ def find_highlights_with_llm(
         except Exception as exc:
             last_error = exc
         if attempt < 3:
-            time.sleep(1.5 * attempt)
+            _wait_with_cancel(1.5 * attempt, cancel_check)
     raise AppError(f"LLMから見どころを取得できませんでした。\n{last_error}")
 
 
@@ -639,7 +701,9 @@ def find_live_edit_segments_with_llm(
     preserve_ending: bool = True,
     include_greeting: bool = True,
     callback: ProgressCallback | None = None,
+    cancel_check: CancelCallback | None = None,
 ) -> list[Highlight]:
+    _check_cancel(cancel_check)
     try:
         from llm_providers import LLMProviderError, build_highlights_schema, get_provider
     except ImportError as exc:
@@ -655,6 +719,7 @@ def find_live_edit_segments_with_llm(
     )
     last_error: Exception | None = None
     for attempt in range(1, 4):
+        _check_cancel(cancel_check)
         _notify(callback, f"{provider.display_name} / {model} が不要部分を除いています…（{attempt}/3）", 0.48)
         try:
             content = provider.complete_json(
@@ -665,12 +730,15 @@ def find_live_edit_segments_with_llm(
                 timeout=300,
                 json_schema=build_highlights_schema(1, 30),
             )
+            _check_cancel(cancel_check)
             segments = normalize_live_edit_segments(
                 _extract_json(content), duration, target_seconds
             )
             return ensure_greeting_segment(
                 transcript, segments, duration, include_greeting
             )
+        except AppCancelled:
+            raise
         except LLMProviderError as exc:
             last_error = exc
             message = str(exc)
@@ -679,7 +747,7 @@ def find_live_edit_segments_with_llm(
         except Exception as exc:
             last_error = exc
         if attempt < 3:
-            time.sleep(1.5 * attempt)
+            _wait_with_cancel(1.5 * attempt, cancel_check)
     raise AppError(f"LLMから生配信の編集区間を取得できませんでした。\n{last_error}")
 
 
@@ -690,6 +758,7 @@ def cut_vertical_clip(
     start: float,
     end: float,
     resolution: str,
+    cancel_check: CancelCallback | None = None,
 ) -> None:
     width, height = (1080, 1920) if resolution == "1080p" else (720, 1280)
     duration = max(0.1, end - start)
@@ -732,8 +801,7 @@ def cut_vertical_clip(
         "+faststart",
         str(output_path),
     ]
-    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    completed = subprocess.run(command, capture_output=True, text=True, creationflags=creationflags)
+    completed = _run_cancellable_command(command, cancel_check)
     if completed.returncode != 0:
         message = (completed.stderr or "FFmpegの処理に失敗しました").strip()
         raise AppError(f"動画の切り抜きに失敗しました。\n{message[-800:]}")
@@ -746,6 +814,7 @@ def cut_standard_clip(
     start: float,
     end: float,
     resolution: str,
+    cancel_check: CancelCallback | None = None,
 ) -> None:
     max_height = 1080 if resolution == "1080p" else 720
     duration = max(0.1, end - start)
@@ -781,8 +850,7 @@ def cut_standard_clip(
         "+faststart",
         str(output_path),
     ]
-    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    completed = subprocess.run(command, capture_output=True, text=True, creationflags=creationflags)
+    completed = _run_cancellable_command(command, cancel_check)
     if completed.returncode != 0:
         message = (completed.stderr or "FFmpegの処理に失敗しました").strip()
         raise AppError(f"通常動画の切り抜きに失敗しました。\n{message[-800:]}")
@@ -798,7 +866,6 @@ def run_pipeline(
     highlight_prompt: str = "",
     clip_count: int = 7,
     resolution: str = "720p",
-    cookie_browser: str | None = None,
     callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     if not re.match(r"^https?://", url.strip(), flags=re.IGNORECASE):
@@ -816,14 +883,14 @@ def run_pipeline(
     with tempfile.TemporaryDirectory(prefix=".youtube-short-", dir=output_root) as temp_name:
         work_dir = Path(temp_name)
         _notify(callback, "YouTube動画の情報を確認しています…", 0.02)
-        info = fetch_metadata(url.strip(), ffmpeg_path, cookie_browser)
+        info = fetch_metadata(url.strip(), ffmpeg_path)
         title = str(info.get("title") or info.get("id") or "youtube_video")
         duration = float(info.get("duration") or 0)
         if duration <= 0:
             raise AppError("動画の長さを取得できませんでした。")
 
         _notify(callback, "YouTube字幕を確認しています…", 0.05)
-        caption = download_caption(url.strip(), info, work_dir, ffmpeg_path, cookie_browser)
+        caption = download_caption(url.strip(), info, work_dir, ffmpeg_path)
         if caption:
             transcript, transcript_source = caption
             _notify(callback, f"{transcript_source}を取得しました。", 0.24)
@@ -832,7 +899,7 @@ def run_pipeline(
             transcript_source = "Whisper"
             _notify(callback, "字幕がないためWhisperを使用します。", 0.24)
 
-        video_path = download_video(url.strip(), work_dir, ffmpeg_path, cookie_browser, callback)
+        video_path = download_video(url.strip(), work_dir, ffmpeg_path, callback)
         if not transcript:
             transcript = transcribe_with_whisper(video_path, whisper_model, callback)
 
@@ -882,6 +949,109 @@ def run_pipeline(
         return {"output_dir": str(final_dir), **report}
 
 
+def run_file_pipeline(
+    video_file: Path | str,
+    api_key: str,
+    output_root: Path,
+    whisper_model: str = "small",
+    llm_provider: str = "openrouter",
+    llm_model: str = "openrouter/auto",
+    highlight_prompt: str = "",
+    clip_count: int = 7,
+    resolution: str = "720p",
+    callback: ProgressCallback | None = None,
+    cancel_check: CancelCallback | None = None,
+) -> dict[str, Any]:
+    _check_cancel(cancel_check)
+    video_path = Path(video_file).expanduser()
+    if not video_path.is_file():
+        raise AppError("選択した動画ファイルが見つかりません。")
+    if not 1 <= clip_count <= 20:
+        raise AppError("作成本数は1〜20本で指定してください。")
+    output_root.mkdir(parents=True, exist_ok=True)
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        raise AppError("動画処理エンジンを準備できません。setup.batをもう一度実行してください。") from exc
+
+    _notify(callback, "動画ファイルを確認しています…", 0.02)
+    duration = probe_video_duration(ffmpeg_path, video_path)
+    _check_cancel(cancel_check)
+    if duration <= 0:
+        raise AppError("動画の長さを取得できませんでした。対応している動画ファイルを選んでください。")
+
+    _notify(callback, "動画の音声をWhisperで文字起こしします…", 0.08)
+    transcript = transcribe_with_whisper(
+        video_path, whisper_model, callback, cancel_check
+    )
+    transcript_source = "Whisper（動画ファイル）"
+    title = video_path.stem or "local_video"
+
+    highlights = find_highlights_with_llm(
+        transcript=transcript,
+        duration=duration,
+        api_key=api_key,
+        provider_id=llm_provider,
+        model=llm_model,
+        custom_instructions=highlight_prompt,
+        clip_count=clip_count,
+        callback=callback,
+        cancel_check=cancel_check,
+    )
+
+    _check_cancel(cancel_check)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    final_dir = output_root / f"{safe_filename(title)}_{stamp}"
+    final_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        _notify(callback, f"{clip_count}本のShortsを書き出します…", 0.56)
+        for index, item in enumerate(highlights, start=1):
+            _check_cancel(cancel_check)
+            filename = f"{index:02d}_{safe_filename(item.title, 45)}.mp4"
+            output_path = final_dir / filename
+            _notify(
+                callback,
+                f"動画 {index}/{clip_count} を作成中: {item.title}",
+                0.55 + (index / clip_count) * 0.42,
+            )
+            cut_vertical_clip(
+                ffmpeg_path,
+                video_path,
+                output_path,
+                item.start,
+                item.end,
+                resolution,
+                cancel_check,
+            )
+
+        _check_cancel(cancel_check)
+        report = {
+            "source_type": "local_file",
+            "source_file_name": video_path.name,
+            "video_title": title,
+            "video_duration": duration,
+            "transcript_source": transcript_source,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+            "clip_count": clip_count,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "highlights": [asdict(item) for item in highlights],
+        }
+        (final_dir / "見どころ一覧.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        (final_dir / "文字起こし.txt").write_text(
+            transcript_as_text(transcript), encoding="utf-8"
+        )
+        _notify(callback, "完了しました。", 1.0)
+        return {"output_dir": str(final_dir), **report}
+    except AppCancelled:
+        shutil.rmtree(final_dir, ignore_errors=True)
+        raise
+
+
 def probe_video_duration(ffmpeg_path: str, video_path: Path) -> float:
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     completed = subprocess.run(
@@ -906,11 +1076,13 @@ def create_live_montage(
     work_dir: Path,
     preserve_ending: bool = True,
     callback: ProgressCallback | None = None,
+    cancel_check: CancelCallback | None = None,
 ) -> None:
     parts_dir = work_dir / "live_parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
     part_paths: list[Path] = []
     for index, item in enumerate(segments, start=1):
+        _check_cancel(cancel_check)
         part_path = parts_dir / f"part_{index:03d}.mp4"
         _notify(
             callback,
@@ -924,6 +1096,7 @@ def create_live_montage(
             item.start,
             item.end,
             resolution,
+            cancel_check,
         )
         part_paths.append(part_path)
 
@@ -971,8 +1144,7 @@ def create_live_montage(
         "+faststart",
         str(output_path),
     ])
-    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    completed = subprocess.run(command, capture_output=True, text=True, creationflags=creationflags)
+    completed = _run_cancellable_command(command, cancel_check)
     if completed.returncode != 0:
         message = (completed.stderr or "FFmpegの結合処理に失敗しました").strip()
         raise AppError(f"生配信の切り抜き動画を結合できませんでした。\n{message[-800:]}")
@@ -991,9 +1163,10 @@ def run_live_edit_pipeline(
     preserve_ending: bool = True,
     include_greeting: bool = True,
     resolution: str = "720p",
-    cookie_browser: str | None = None,
     callback: ProgressCallback | None = None,
+    cancel_check: CancelCallback | None = None,
 ) -> dict[str, Any]:
+    _check_cancel(cancel_check)
     if not re.match(r"^https?://", url.strip(), flags=re.IGNORECASE):
         raise AppError("YouTubeの生配信URLを正しく入力してください。")
     if not 30 <= target_seconds <= 1800:
@@ -1011,7 +1184,8 @@ def run_live_edit_pipeline(
     with tempfile.TemporaryDirectory(prefix=".youtube-live-edit-", dir=output_root) as temp_name:
         work_dir = Path(temp_name)
         _notify(callback, "生配信の情報を確認しています…", 0.02)
-        info = fetch_metadata(url.strip(), ffmpeg_path, cookie_browser)
+        info = fetch_metadata(url.strip(), ffmpeg_path)
+        _check_cancel(cancel_check)
         title = str(info.get("title") or info.get("id") or "youtube_live")
         live_status = str(info.get("live_status") or "")
         is_live = bool(info.get("is_live")) or live_status == "is_live"
@@ -1029,13 +1203,16 @@ def run_live_edit_pipeline(
                 url.strip(),
                 work_dir,
                 ffmpeg_path,
-                cookie_browser,
                 callback,
                 max_duration_seconds=capture_seconds,
+                cancel_check=cancel_check,
             )
             transcript_source = "Whisper（配信中の取得映像）"
-            transcript = transcribe_with_whisper(video_path, whisper_model, callback)
+            transcript = transcribe_with_whisper(
+                video_path, whisper_model, callback, cancel_check
+            )
             duration = probe_video_duration(ffmpeg_path, video_path)
+            _check_cancel(cancel_check)
             if duration <= 0:
                 duration = max(item.end for item in transcript)
             source_status = "live"
@@ -1044,7 +1221,8 @@ def run_live_edit_pipeline(
             if duration <= 0:
                 raise AppError("生配信アーカイブの長さを取得できませんでした。")
             _notify(callback, "生配信アーカイブの字幕を確認しています…", 0.05)
-            caption = download_caption(url.strip(), info, work_dir, ffmpeg_path, cookie_browser)
+            caption = download_caption(url.strip(), info, work_dir, ffmpeg_path)
+            _check_cancel(cancel_check)
             if caption:
                 transcript, transcript_source = caption
                 _notify(callback, f"{transcript_source}を取得しました。", 0.24)
@@ -1053,10 +1231,16 @@ def run_live_edit_pipeline(
                 transcript_source = "Whisper"
                 _notify(callback, "字幕がないためWhisperを使用します。", 0.24)
             video_path = download_video(
-                url.strip(), work_dir, ffmpeg_path, cookie_browser, callback
+                url.strip(),
+                work_dir,
+                ffmpeg_path,
+                callback,
+                cancel_check=cancel_check,
             )
             if not transcript:
-                transcript = transcribe_with_whisper(video_path, whisper_model, callback)
+                transcript = transcribe_with_whisper(
+                    video_path, whisper_model, callback, cancel_check
+                )
             source_status = "archive"
 
         if target_seconds > duration:
@@ -1075,49 +1259,57 @@ def run_live_edit_pipeline(
             preserve_ending=preserve_ending,
             include_greeting=include_greeting,
             callback=callback,
+            cancel_check=cancel_check,
         )
 
+        _check_cancel(cancel_check)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         final_dir = output_root / f"{safe_filename(title)}_生配信編集_{stamp}"
         final_dir.mkdir(parents=True, exist_ok=False)
         duration_label = format_duration_label(target_seconds)
         filename_prefix = "生配信切り抜き_約" if preserve_ending else "生配信切り抜き_"
         output_path = final_dir / f"{filename_prefix}{duration_label}.mp4"
-        create_live_montage(
-            ffmpeg_path=ffmpeg_path,
-            video_path=video_path,
-            output_path=output_path,
-            segments=segments,
-            target_seconds=target_seconds,
-            resolution=resolution,
-            work_dir=work_dir,
-            preserve_ending=preserve_ending,
-            callback=callback,
-        )
-        output_duration = probe_video_duration(ffmpeg_path, output_path)
-        report = {
-            "mode": "live_edit",
-            "source_url": url.strip(),
-            "video_title": title,
-            "source_status": source_status,
-            "source_duration": duration,
-            "target_duration": target_seconds,
-            "target_duration_minutes": target_seconds / 60,
-            "output_duration": output_duration,
-            "output_duration_minutes": output_duration / 60,
-            "preserve_ending": preserve_ending,
-            "include_greeting": include_greeting,
-            "transcript_source": transcript_source,
-            "llm_provider": llm_provider,
-            "llm_model": llm_model,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "segments": [asdict(item) for item in segments],
-        }
-        (final_dir / "編集内容.json").write_text(
-            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        (final_dir / "文字起こし.txt").write_text(
-            transcript_as_text(transcript), encoding="utf-8"
-        )
-        _notify(callback, "生配信の切り抜き動画が完成しました。", 1.0)
-        return {"output_dir": str(final_dir), "output_file": str(output_path), **report}
+        try:
+            create_live_montage(
+                ffmpeg_path=ffmpeg_path,
+                video_path=video_path,
+                output_path=output_path,
+                segments=segments,
+                target_seconds=target_seconds,
+                resolution=resolution,
+                work_dir=work_dir,
+                preserve_ending=preserve_ending,
+                callback=callback,
+                cancel_check=cancel_check,
+            )
+            _check_cancel(cancel_check)
+            output_duration = probe_video_duration(ffmpeg_path, output_path)
+            report = {
+                "mode": "live_edit",
+                "source_url": url.strip(),
+                "video_title": title,
+                "source_status": source_status,
+                "source_duration": duration,
+                "target_duration": target_seconds,
+                "target_duration_minutes": target_seconds / 60,
+                "output_duration": output_duration,
+                "output_duration_minutes": output_duration / 60,
+                "preserve_ending": preserve_ending,
+                "include_greeting": include_greeting,
+                "transcript_source": transcript_source,
+                "llm_provider": llm_provider,
+                "llm_model": llm_model,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "segments": [asdict(item) for item in segments],
+            }
+            (final_dir / "編集内容.json").write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            (final_dir / "文字起こし.txt").write_text(
+                transcript_as_text(transcript), encoding="utf-8"
+            )
+            _notify(callback, "生配信の切り抜き動画が完成しました。", 1.0)
+            return {"output_dir": str(final_dir), "output_file": str(output_path), **report}
+        except AppCancelled:
+            shutil.rmtree(final_dir, ignore_errors=True)
+            raise

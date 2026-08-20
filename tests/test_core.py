@@ -1,5 +1,8 @@
 import json
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -8,6 +11,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import (
+    AppCancelled,
+    AppError,
     Highlight,
     TranscriptSegment,
     build_highlight_prompts,
@@ -19,7 +24,9 @@ from core import (
     parse_json3,
     parse_timestamp,
     parse_vtt,
+    run_file_pipeline,
     safe_filename,
+    _run_cancellable_command,
 )
 
 
@@ -119,6 +126,86 @@ class CoreTests(unittest.TestCase):
         result = ensure_greeting_segment(transcript, segments, duration=60)
         self.assertEqual(result[0].title, "冒頭の挨拶")
         self.assertLess(result[0].start, result[1].start)
+
+    def test_file_pipeline_uses_local_video_without_saving_full_path(self):
+        from unittest.mock import patch
+
+        transcript = [TranscriptSegment(0, 20, "ローカル動画の文字起こし")]
+        highlights = [Highlight(0, 20, "見どころ", "理由", 90)]
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "元動画.mp4"
+            source.write_bytes(b"test")
+            with (
+                patch("imageio_ffmpeg.get_ffmpeg_exe", return_value="ffmpeg"),
+                patch("core.probe_video_duration", return_value=120.0),
+                patch("core.transcribe_with_whisper", return_value=transcript),
+                patch("core.find_highlights_with_llm", return_value=highlights),
+                patch("core.cut_vertical_clip") as cut_clip,
+            ):
+                result = run_file_pipeline(
+                    video_file=source,
+                    api_key="test-key",
+                    output_root=root / "outputs",
+                    clip_count=1,
+                )
+
+            report = json.loads((Path(result["output_dir"]) / "見どころ一覧.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["source_type"], "local_file")
+            self.assertEqual(report["source_file_name"], "元動画.mp4")
+            self.assertNotIn("source_path", report)
+            cut_clip.assert_called_once()
+
+    def test_file_pipeline_rejects_missing_video(self):
+        with tempfile.TemporaryDirectory() as name:
+            with self.assertRaises(AppError):
+                run_file_pipeline(
+                    video_file=Path(name) / "missing.mp4",
+                    api_key="test-key",
+                    output_root=Path(name) / "outputs",
+                )
+
+    def test_cancellable_command_stops_running_process(self):
+        cancel_event = threading.Event()
+        timer = threading.Timer(0.2, cancel_event.set)
+        started = time.monotonic()
+        timer.start()
+        try:
+            with self.assertRaises(AppCancelled):
+                _run_cancellable_command(
+                    [sys.executable, "-c", "import time; time.sleep(10)"],
+                    cancel_event.is_set,
+                )
+        finally:
+            timer.cancel()
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_file_pipeline_removes_partial_output_when_cancelled(self):
+        from unittest.mock import patch
+
+        transcript = [TranscriptSegment(0, 20, "ローカル動画の文字起こし")]
+        highlights = [Highlight(0, 20, "見どころ", "理由", 90)]
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "元動画.mp4"
+            source.write_bytes(b"test")
+            output_root = root / "outputs"
+            with (
+                patch("imageio_ffmpeg.get_ffmpeg_exe", return_value="ffmpeg"),
+                patch("core.probe_video_duration", return_value=120.0),
+                patch("core.transcribe_with_whisper", return_value=transcript),
+                patch("core.find_highlights_with_llm", return_value=highlights),
+                patch("core.cut_vertical_clip", side_effect=AppCancelled("cancelled")),
+            ):
+                with self.assertRaises(AppCancelled):
+                    run_file_pipeline(
+                        video_file=source,
+                        api_key="test-key",
+                        output_root=output_root,
+                        clip_count=1,
+                        cancel_check=lambda: False,
+                    )
+            self.assertEqual(list(output_root.iterdir()), [])
 
 
 if __name__ == "__main__":

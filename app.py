@@ -8,9 +8,9 @@ import threading
 import webbrowser
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
-from core import AppError, run_live_edit_pipeline, run_pipeline
+from core import AppCancelled, AppError, run_file_pipeline, run_live_edit_pipeline
 from llm_providers import LLMProviderError, available_providers, get_provider
 from secure_storage import (
     SecureStorageError,
@@ -36,6 +36,7 @@ class ShortsApp(tk.Tk):
         self.minsize(800, 780)
         self.configure(bg="#f4f6fb")
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.cancel_event = threading.Event()
         self.last_output: Path | None = None
         self.providers = available_providers()
         self.provider_name_to_id = {item.display_name: item.provider_id for item in self.providers}
@@ -67,7 +68,7 @@ class ShortsApp(tk.Tk):
         ttk.Label(root, text="YouTube Shorts 自動メーカー", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             root,
-            text="通常動画のShorts作成と、生配信の不要部分を除く編集をタブで切り替えられます。",
+            text="PC内の動画からのShorts作成と、生配信の不要部分を除く編集をタブで切り替えられます。",
             style="Sub.TLabel",
         ).pack(anchor="w", pady=(3, 18))
 
@@ -75,16 +76,19 @@ class ShortsApp(tk.Tk):
         self.mode_notebook.pack(fill="x")
         self.standard_tab = ttk.Frame(self.mode_notebook, style="TFrame")
         self.live_tab = ttk.Frame(self.mode_notebook, style="TFrame")
-        self.mode_notebook.add(self.standard_tab, text="通常動画・Shorts")
+        self.mode_notebook.add(self.standard_tab, text="動画ファイル・Shorts")
         self.mode_notebook.add(self.live_tab, text="生配信編集")
 
         card = ttk.Frame(self.standard_tab, style="Card.TFrame", padding=22)
         card.pack(fill="x")
 
-        ttk.Label(card, text="YouTube URL", style="Card.TLabel").grid(row=0, column=0, sticky="w")
-        self.url_var = tk.StringVar()
-        self.url_entry = ttk.Entry(card, textvariable=self.url_var)
-        self.url_entry.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(5, 15))
+        ttk.Label(card, text="元動画ファイル", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+        self.video_file_var = tk.StringVar()
+        self.video_file_entry = ttk.Entry(card, textvariable=self.video_file_var)
+        self.video_file_entry.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(5, 15))
+        ttk.Button(card, text="動画を選択", command=self._select_video_file).grid(
+            row=1, column=3, sticky="ew", padx=(8, 0), pady=(5, 15)
+        )
 
         ttk.Label(card, text="LLM接続先", style="Card.TLabel").grid(row=2, column=0, sticky="w")
         ttk.Label(card, text="OpenRouter APIキー", style="Card.TLabel").grid(row=2, column=1, sticky="w", padx=(12, 0))
@@ -142,8 +146,9 @@ class ShortsApp(tk.Tk):
 
         ttk.Label(card, text="Whisper精度", style="Card.TLabel").grid(row=10, column=0, sticky="w")
         ttk.Label(card, text="動画サイズ", style="Card.TLabel").grid(row=10, column=1, sticky="w", padx=(12, 0))
-        ttk.Label(card, text="ログイン動画", style="Card.TLabel").grid(row=10, column=2, sticky="w", padx=(12, 0))
-        ttk.Label(card, text="作成本数", style="Card.TLabel").grid(row=10, column=3, sticky="w", padx=(12, 0))
+        ttk.Label(card, text="作成本数", style="Card.TLabel").grid(
+            row=10, column=2, columnspan=2, sticky="w", padx=(12, 0)
+        )
 
         self.whisper_var = tk.StringVar(value="標準（small）")
         self.whisper_combo = ttk.Combobox(
@@ -154,10 +159,6 @@ class ShortsApp(tk.Tk):
         ttk.Combobox(
             card, textvariable=self.resolution_var, state="readonly", values=("720p（高速）", "1080p（高画質）")
         ).grid(row=11, column=1, sticky="ew", padx=(12, 0), pady=(5, 0))
-        self.browser_var = tk.StringVar(value="使用しない")
-        ttk.Combobox(
-            card, textvariable=self.browser_var, state="readonly", values=("使用しない", "Edge", "Chrome")
-        ).grid(row=11, column=2, sticky="ew", padx=(12, 0), pady=(5, 0))
         self.clip_count_var = tk.IntVar(value=7)
         ttk.Spinbox(
             card,
@@ -166,7 +167,7 @@ class ShortsApp(tk.Tk):
             to=20,
             state="readonly",
             width=7,
-        ).grid(row=11, column=3, sticky="ew", padx=(12, 0), pady=(5, 0))
+        ).grid(row=11, column=2, columnspan=2, sticky="ew", padx=(12, 0), pady=(5, 0))
         for column in range(4):
             card.columnconfigure(column, weight=1)
 
@@ -244,7 +245,7 @@ class ShortsApp(tk.Tk):
         ).grid(row=9, column=0, columnspan=4, sticky="w")
         ttk.Label(
             live_card,
-            text="OpenRouter・モデル・Whisper・画質・ログイン設定は「通常動画」タブの設定を使用します。",
+            text="OpenRouter・モデル・Whisper・画質は「動画ファイル」タブの設定を使用します。",
             style="Card.TLabel",
             foreground="#667085",
         ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(4, 0))
@@ -255,13 +256,20 @@ class ShortsApp(tk.Tk):
         action_row.pack(fill="x", pady=(18, 10))
         self.start_button = ttk.Button(action_row, text="Shortsを作成", style="Accent.TButton", command=self._start)
         self.start_button.pack(side="left")
+        self.cancel_button = ttk.Button(
+            action_row,
+            text="キャンセル",
+            command=self._cancel_current,
+            state="disabled",
+        )
+        self.cancel_button.pack(side="left", padx=(10, 0))
         self.open_button = ttk.Button(action_row, text="出力フォルダーを開く", command=self._open_output, state="disabled")
         self.open_button.pack(side="left", padx=(10, 0))
         self.mode_notebook.bind("<<NotebookTabChanged>>", self._on_mode_changed)
 
         self.progress = ttk.Progressbar(root, mode="determinate", maximum=100)
         self.progress.pack(fill="x", pady=(2, 8))
-        self.status_var = tk.StringVar(value="URLとOpenRouter APIキーを入力してください。")
+        self.status_var = tk.StringVar(value="動画ファイルを選び、OpenRouter APIキーを入力してください。")
         ttk.Label(root, textvariable=self.status_var, style="Sub.TLabel").pack(anchor="w", pady=(0, 9))
 
         log_frame = ttk.Frame(root, style="Card.TFrame", padding=12)
@@ -351,6 +359,21 @@ class ShortsApp(tk.Tk):
     def _open_api_key_page(self) -> None:
         webbrowser.open(get_provider(self._provider_id()).api_key_url)
 
+    def _select_video_file(self) -> None:
+        videos_dir = Path.home() / "Videos"
+        selected = filedialog.askopenfilename(
+            title="Shortsにする元動画を選択",
+            initialdir=str(videos_dir if videos_dir.exists() else Path.home()),
+            filetypes=(
+                ("動画ファイル", "*.mp4 *.mov *.mkv *.webm *.avi *.m4v *.wmv *.flv *.ts *.mts *.m2ts"),
+                ("MP4動画", "*.mp4"),
+                ("すべてのファイル", "*.*"),
+            ),
+        )
+        if selected:
+            self.video_file_var.set(selected)
+            self.status_var.set("動画を選択しました。APIキーとモデルを確認して開始してください。")
+
     def _on_provider_changed(self, _event: object | None = None) -> None:
         provider = get_provider(self._provider_id())
         self.model_display_to_id.clear()
@@ -382,19 +405,27 @@ class ShortsApp(tk.Tk):
         self.log.see("end")
         self.log.configure(state="disabled")
 
+    def _cancel_current(self) -> None:
+        if str(self.cancel_button["state"]) == "disabled":
+            return
+        self.cancel_event.set()
+        self.cancel_button.configure(state="disabled")
+        self.status_var.set("キャンセルしています…")
+        self._append_log("キャンセルを受け付けました。安全に処理を停止しています。")
+
     def _on_mode_changed(self, _event: object | None = None) -> None:
         if self.mode_notebook.select() == str(self.live_tab):
             self.start_button.configure(text="生配信の不要部分を除いて作成")
             self.status_var.set("生配信URLと完成動画の長さを入力してください。")
         else:
             self.start_button.configure(text="Shortsを作成")
-            self.status_var.set("URLとOpenRouter APIキーを入力してください。")
+            self.status_var.set("動画ファイルを選び、OpenRouter APIキーを入力してください。")
 
     def _start(self) -> None:
         if self.mode_notebook.select() == str(self.live_tab):
             self._start_live_edit()
             return
-        url = self.url_var.get().strip()
+        video_file = self.video_file_var.get().strip()
         key = self.key_var.get().strip()
         provider_id = self._provider_id()
         model = self._selected_model_id()
@@ -407,8 +438,11 @@ class ShortsApp(tk.Tk):
         if not 1 <= clip_count <= 20:
             messagebox.showwarning(APP_NAME, "作成本数は1〜20本で選んでください。")
             return
-        if not url or not key or not model:
-            messagebox.showwarning(APP_NAME, "YouTube URL、OpenRouter APIキー、モデルを入力してください。")
+        if not video_file or not key or not model:
+            messagebox.showwarning(APP_NAME, "動画ファイル、OpenRouter APIキー、モデルを入力してください。")
+            return
+        if not Path(video_file).is_file():
+            messagebox.showwarning(APP_NAME, "選択した動画ファイルが見つかりません。もう一度選択してください。")
             return
         try:
             self._save_settings()
@@ -416,23 +450,23 @@ class ShortsApp(tk.Tk):
             messagebox.showerror(APP_NAME, str(exc))
             return
         self.start_button.configure(state="disabled")
+        self.cancel_event.clear()
+        self.cancel_button.configure(state="normal")
         self.open_button.configure(state="disabled")
         self.progress["value"] = 0
-        self._append_log("処理を開始しました。")
+        self._append_log("動画ファイルからShorts作成を開始しました。")
 
         whisper = {"高速（tiny）": "tiny", "標準（small）": "small", "高精度（medium）": "medium"}[
             self.whisper_var.get()
         ]
         resolution = "1080p" if self.resolution_var.get().startswith("1080") else "720p"
-        browser = {"Edge": "edge", "Chrome": "chrome"}.get(self.browser_var.get())
-
         def callback(message: str, progress: float | None) -> None:
             self.events.put(("progress", (message, progress)))
 
         def worker() -> None:
             try:
-                result = run_pipeline(
-                    url=url,
+                result = run_file_pipeline(
+                    video_file=Path(video_file),
                     api_key=key,
                     output_root=OUTPUT_DIR,
                     whisper_model=whisper,
@@ -441,10 +475,12 @@ class ShortsApp(tk.Tk):
                     highlight_prompt=highlight_prompt,
                     clip_count=clip_count,
                     resolution=resolution,
-                    cookie_browser=browser,
                     callback=callback,
+                    cancel_check=self.cancel_event.is_set,
                 )
                 self.events.put(("done", result))
+            except AppCancelled:
+                self.events.put(("cancelled", None))
             except Exception as exc:
                 self.events.put(("error", exc))
 
@@ -473,7 +509,7 @@ class ShortsApp(tk.Tk):
         if not url or not key or not model:
             messagebox.showwarning(
                 APP_NAME,
-                "生配信URLを入力し、通常動画タブでOpenRouter APIキーとモデルを設定してください。",
+                "生配信URLを入力し、動画ファイルタブでOpenRouter APIキーとモデルを設定してください。",
             )
             return
         target_seconds = int(round(target_minutes * 60))
@@ -483,6 +519,8 @@ class ShortsApp(tk.Tk):
             messagebox.showerror(APP_NAME, str(exc))
             return
         self.start_button.configure(state="disabled")
+        self.cancel_event.clear()
+        self.cancel_button.configure(state="normal")
         self.open_button.configure(state="disabled")
         self.progress["value"] = 0
         self._append_log("生配信編集を開始しました。")
@@ -490,8 +528,6 @@ class ShortsApp(tk.Tk):
             self.whisper_var.get()
         ]
         resolution = "1080p" if self.resolution_var.get().startswith("1080") else "720p"
-        browser = {"Edge": "edge", "Chrome": "chrome"}.get(self.browser_var.get())
-
         def callback(message: str, progress: float | None) -> None:
             self.events.put(("progress", (message, progress)))
 
@@ -510,10 +546,12 @@ class ShortsApp(tk.Tk):
                     preserve_ending=preserve_ending,
                     include_greeting=include_greeting,
                     resolution=resolution,
-                    cookie_browser=browser,
                     callback=callback,
+                    cancel_check=self.cancel_event.is_set,
                 )
                 self.events.put(("done", result))
+            except AppCancelled:
+                self.events.put(("cancelled", None))
             except Exception as exc:
                 self.events.put(("error", exc))
 
@@ -533,6 +571,7 @@ class ShortsApp(tk.Tk):
                     result = payload  # type: ignore[assignment]
                     self.last_output = Path(result["output_dir"])
                     self.start_button.configure(state="normal")
+                    self.cancel_button.configure(state="disabled")
                     self.open_button.configure(state="normal")
                     self.progress["value"] = 100
                     if result.get("mode") == "live_edit":
@@ -574,12 +613,18 @@ class ShortsApp(tk.Tk):
                     messagebox.showerror(APP_NAME, message)
                 elif event == "error":
                     self.start_button.configure(state="normal")
+                    self.cancel_button.configure(state="disabled")
                     message = str(payload)
                     if not isinstance(payload, (AppError, LLMProviderError)):
                         message = f"予期しないエラーが発生しました。\n{message}"
                     self.status_var.set("処理を完了できませんでした。")
                     self._append_log("エラー: " + message)
                     messagebox.showerror(APP_NAME, message)
+                elif event == "cancelled":
+                    self.start_button.configure(state="normal")
+                    self.cancel_button.configure(state="disabled")
+                    self.status_var.set("処理をキャンセルしました。")
+                    self._append_log("処理をキャンセルしました。途中ファイルは削除されました。")
         except queue.Empty:
             pass
         self.after(100, self._poll_events)
